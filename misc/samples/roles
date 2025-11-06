@@ -1,0 +1,83 @@
+{
+  "id": "3fef8a21e7f53606402fcd4f692746",
+  "description": "Full administrative access to all API routes and system resources.",
+  "name": "superuser",
+  "permissions": [
+    "*.*"
+  ]
+}
+-------------
+{
+  "id": "7cf9d807c0753bc691425f291a73ce",
+  "description": "Manages ICT infrastructure, user accounts, and system access for Murang’a County.",
+  "name": "ict_admin",
+  "permissions": [
+    "users.create",
+    "users.update",
+    "users.deactivate",
+    "roles.assign",
+    "systems.monitor",
+    "assets.view",
+    "logs.view"
+  ]
+}
+--------------
+  {
+    "name": "finance_officer",
+    "description": "Oversees financial records, asset valuation, and budgeting for Murang’a County.",
+    "permissions": [
+      "assets.view",
+      "assets.revalue",
+      "assets.dispose",
+      "departments.view",
+      "reports.generate",
+      "transactions.approve"
+    ]
+  }
+  
+ -------------
+ {
+  "id": "6d001264d699e34ba1d084c9711cd3",
+  "description": "Manages ICT infrastructure, user accounts, and system access for Murang’a County.",
+  "name": "ict_admin_murang'a_county",
+  "permissions": [
+    "users.create",
+    "users.update",
+    "users.deactivate",
+    "roles.assign",
+    "systems.monitor",
+    "assets.view",
+    "logs.view"
+  ]
+}
+------------------
+ {
+    "name": "procurement_officer",
+    "description": "Handles asset acquisition, supplier management, and procurement approvals.",
+    "permissions": [
+      "assets.create",
+      "assets.update",
+      "suppliers.manage",
+      "procurement.approve",
+      "reports.view"
+    ]
+  }
+-------
+{
+  "id": "a32df9729375c825d295bd317b8e8b",
+  "description": "Supervises departmental assets and staff under a specific department.",
+  "name": "department_head",
+  "permissions": [
+    "assets.view",
+    "maintenance.request",
+    "reports.view",
+    "users.view"
+  ]
+}
+-----------
+{
+  "id": "0a76806dc312733ae4dd271b271048",
+  "description": "default role assigned to user after registration",
+  "name": "no_priv_default",
+  "permissions": []
+}

@@ -1,0 +1,122 @@
+fingerprinting
+transfers
+
+add create department details
+patch department head etc
+
+
+reavaluate deptment admin
+
+autochecker
+user is dept head to dept he belongs
+
+
+
+SEC CHANGES
+  get 
+list devices logged in from previously
+force mfa incase of new device
+
+adoptive auth - challenge mfa if suspecious behavior
+lock account incase of unsuccessful 5 logins known device, 2- new device
+domant account reactivation alerts
+rate limiting 5,2
+account enumeration prevention
+temp lockout with exponential backoff
+
+ip witelisting,blacklisting
+
+1. IPQualityScore (IPQS)
+https://www.ipqualityscore.com/
+     5000 req/month 
+2. abuse ipdb
+     1000 req/day
+     https://www.abuseipdb.com/
+3. iphub
+https://iphub.info/
+    1000 req/day
+    
+https://lite.ip2location.com/
+	free db download
+	  in house
+	  
+MaxMind GeoIP2
+	https://dev.maxmind.com/
+	free
+rec
+Layer 1: AbuseIPDB (free, 1000/day) - Check on login
+Layer 2: IPHub (free, 1000/day) - Proxy/VPN detection
+Layer 3: MaxMind GeoLite2 (self-hosted) - ISP/connection type
+Fallback: IP2Location Lite (self-hosted)
+
+
+
+Scoring System Example
+
+Clean residential IP: Risk score 0-20 (allow)
+VPN/Proxy: Risk score 40-60 (challenge with MFA)
+Data center IP: Risk score 60-80 (force MFA + manual review)
+Known attacker: Risk score 80-100 (block or heavy verification)
+
+asn tracking
+lookups
+ipinfo.io 50,000 req/month
+	ASN,ORG,TYPE
+https://dev.maxmind.com/geoip/geolite2-free-geolocation-data self hosted
+https://lite.ip2location.com/ - sqlite db
+
+
+Check sequence:
+1. Lookup IP → ASN
+2. Classify ASN type:
+   - Residential ISP (Safaricom, Telkom Kenya) = LOW RISK
+   - Mobile carrier = LOW RISK
+   - Enterprise/Corporate = MEDIUM RISK (verify)
+   - Hosting/Data center (DigitalOcean, AWS) = HIGH RISK
+   - Known VPN ASN = HIGH RISK (requires policy decision)
+
+3. Score based on:
+   - Is ASN consistent with user's country?
+   - Is ASN type unexpected (data center vs residential)?
+   - Has user logged from this ASN before?
+
+
+https://haveibeenpwned.com/API/v3 - force user to use secure pass, if pass found in breach
+
+tor detection
+  https://check.torproject.org/torbulkexitlist
+  https://www.dan.me.uk/torlist/
+
+check timezone missmatch
+
+webrtc leak detection
+
+net segmentation
+
+
+
+
+finderprinting
+  canvas
+  webgl fingerprinting - slightly hhigher cpu usage
+  audio contect fingerprinting
+  screeen resolution n color depth
+  timezone and languafe
+  user agent analysis
+  hw concurency cpu cores
+  dev memory,ram
+  device name, os, browser version
+
+
+
+
+
+
+
+
+
+
+
+
+
+

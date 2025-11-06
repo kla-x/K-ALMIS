@@ -1,0 +1,66 @@
+ "email": "superadmin@example.com",
+{
+  "profile_pic": "http://profile.com/some/pic/here",
+  "first_name": "super",
+  "last_name": "admin",
+  "email": "superadmin@example.com",
+  "phone_number": "25412345678",
+  "department_id": "DEPT-ICT-001",
+  "position_title": "admin",
+  "gov_level": "national",
+  "entity_type": "department",
+  "entity_name": "System super Admin",
+  "location": {
+    "administrative_location": {
+      "county": "Murang'a",
+      "constituency": "Mathioya",
+      "ward": "Kiru"
+    },
+    "coordinates": {
+      "lat": -0.7832,
+      "lng": 37.04
+    },
+    "address": "Kangari Market, Murang'a"
+  },
+  "notes": "string",
+  "status": "active",
+  "id": "5eae8737-4dc3-489e-8251-97de981f4a30",
+  "created_at": "2025-10-05T10:44:05.409825Z",
+  "updated_at": null,
+  "role": {
+    "name": "superuser"
+  }
+}
+---------------
+{
+  "profile_pic": "http://profile.com/some/pic/here",
+  "first_name": "jackson",
+  "last_name": "kirubi",
+  "email": "jkirubi@muranga.ict.ac.ke",
+  "phone_number": "2434354354534",
+  "department_id": "a3351b3a-0d44-44be-be65-8972b519472b",
+  "position_title": "ict head",
+  "gov_level": "county",
+  "entity_type": "department",
+  "entity_name": "Murang'a County ICT Department",
+  "location": {
+    "administrative_location": {
+      "county": "Murang'a",
+      "constituency": "Kandara",
+      "ward": "Ithiru"
+    },
+    "coordinates": {
+      "lat": -0.7832,
+      "lng": 37.04
+    },
+    "address": "Kangari Market, Murang'a"
+  },
+  "notes": "will be assigned head",
+  "status": "active",
+  "id": "583911c5-6207-427c-877e-16d656a69459",
+  "created_at": "2025-10-05T14:52:00.045420Z",
+  "updated_at": null,
+  "role": {
+    "name": "ict_admin"
+  }
+}

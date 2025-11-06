@@ -1,0 +1,55 @@
+{
+  "assets": [
+    {
+      "name": "Stadium",
+      "pic": "https://res.cloudinary.com/duboyr09q/image/upload/v1759664632/equipment_images/equipment_1759664630710.jpg",
+      "other_pics": null,
+      "description": "The Murang'a grand new stadium",
+      "category": "Buildings and building improvements",
+      "tag_number": "string",
+      "serial_number": "00100",
+      "department_id": "DEPT-ICT-001",
+      "responsible_officer_id": "5eae8737-4dc3-489e-8251-97de981f4a30",
+      "location": {
+        "administrative_location": {
+          "county": "Murang'a",
+          "constituency": "Gatanga",
+          "ward": "Gatanga"
+        },
+        "coordinates": {
+          "lat": 0.011,
+          "lng": 30.1212
+        },
+        "address": "Murang'a Town"
+      },
+      "status": "Under Maintenance",
+      "condition": "new",
+      "acquisition_date": "2025-10-05",
+      "acquisition_cost": "1000000.00",
+      "source_of_funds": "government",
+      "depreciation_rate": "3.00",
+      "useful_life_years": 9,
+      "is_portable_attractive": false,
+      "insurance_details": null,
+      "maintenance_schedule": null,
+      "specific_attributes": null,
+      "id": "d6ecfb77-238f-4c29-a5c8-1b5025df19fb",
+      "barcode": null,
+      "qr_code": null,
+      "current_value": "1000000.00",
+      "disposal_date": null,
+      "disposal_value": null,
+      "disposal_method": null,
+      "revaluation_history": null,
+      "created_at": "2025-10-05T11:44:30.583449Z",
+      "updated_at": null,
+      "is_deleted": false,
+      "department_name": null,
+      "responsible_officer_name": null
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "size": 20,
+  "total_pages": 1
+}

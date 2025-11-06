@@ -1,0 +1,3458 @@
+from fastapi import APIRouter, Depends,HTTPException,status
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from ..models import Assets,User,Departments,AssetLifecycleEvents
+from ..database import get_db
+from ..utilities import get_current_user,generate_id
+from ..schemas.assets import AssignAssetUserDep
+from ..system_vars import sys_logger,debugging
+from ..services.logger_queue import enqueue_log
+from ..schemas.main import  ActionType, LogLevel
+from ..services.policy_eval import check_simple_permission, check_full_permission, build_asset_resource,require_specific_role
+
+router = APIRouter(
+    prefix="/api/v1/assets",
+    tags=["Assets Assignment"]
+    )
+
+@router.post("/{asset_id}/assign")
+async def assign_user_an_asset(asset_id: str, resp: AssignAssetUserDep, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    
+    asset = db.query(Assets).filter(Assets.id == asset_id).first()
+    if not asset:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.UPDATE,
+                target_table="assets",
+                target_id=asset_id,
+                details="Asset not found for assignment",
+                level=LogLevel.INFO
+            )
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    try:
+        resource = build_asset_resource(asset)
+        # check_full_permission(current_user, "asset", "assign", db, resource=resource)
+    except HTTPException as e:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="assets",
+                target_id=asset_id,
+                details=f"Assignment denied: {e.detail}",
+                level=LogLevel.CRITICAL
+            )
+        raise
+    
+    if not resp.user_id and not resp.dept_id:
+        raise HTTPException(status_code=400, detail="User or department must be specified")
+    
+    if asset.department_id is not None or asset.responsible_officer_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Asset already assigned to department or user"
+        )
+    
+    usr = None
+    dep = None
+    assignment_details = {}
+    
+    if resp.user_id and resp.dept_id:
+        usr = db.query(User).filter(User.id == resp.user_id).first()
+        dep = db.query(Departments).filter(Departments.dept_id == resp.dept_id).first()
+        
+        if not usr or not dep:
+            raise HTTPException(status_code=400, detail="User or department not found")
+        
+        if usr.department_id != resp.dept_id:
+            raise HTTPException(status_code=400, detail="User not in specified department")
+        
+        asset.responsible_officer_id = resp.user_id
+        asset.department_id = resp.dept_id
+        assignment_details = {
+            "type": "user_and_department",
+            "user_name": f"{usr.first_name} {usr.last_name}",
+            "department_name": dep.name
+        }
+    
+    elif resp.user_id:
+        usr = db.query(User).filter(User.id == resp.user_id).first()
+        if not usr:
+            raise HTTPException(status_code=400, detail="User not found")
+        
+        asset.responsible_officer_id = resp.user_id
+        asset.department_id = usr.department_id
+        assignment_details = {
+            "type": "user_only",
+            "user_name": f"{usr.first_name} {usr.last_name}",
+            "department_id": usr.department_id
+        }
+    
+    elif resp.dept_id:
+        dep = db.query(Departments).filter(Departments.dept_id == resp.dept_id).first()
+        if not dep:
+            raise HTTPException(status_code=400, detail="Department not found")
+        
+        asset.department_id = resp.dept_id
+        assignment_details = {
+            "type": "department_only",
+            "department_name": dep.name
+        }
+    
+    try:
+        db.commit()
+        db.refresh(asset)
+        
+        lifecycle_event = AssetLifecycleEvents(
+            id=generate_id(60),
+            asset_id=asset_id,
+            event_type="assigned",
+            performed_by=current_user.id,
+            details=assignment_details,
+            remarks=f"Asset assigned by {current_user.first_name} {current_user.last_name}"
+        )
+        db.add(lifecycle_event)
+        db.commit()
+        
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.UPDATE,
+                target_table="assets",
+                target_id=asset_id,
+                details=assignment_details,
+                level=LogLevel.INFO
+            )
+        
+        return {"detail": "Asset assigned successfully", "assignment": assignment_details}
+        
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Assignment failed due to db err")
+
+@router.delete("/{asset_id}/unassign", status_code=status.HTTP_200_OK)
+async def unassign_asset_from_usr(asset_id: str, current_user: User = Depends(get_current_user),  db: Session = Depends(get_db)):
+    
+    asset = db.query(Assets).filter(Assets.id == asset_id).first()
+    if not asset:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.UPDATE,
+                target_table="assets",
+                target_id=asset_id,
+                details="Asset not found for unassignment",
+                level=LogLevel.INFO
+            )
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    try:
+        resource = build_asset_resource(asset)
+        check_full_permission(current_user, "asset", "unassign", db, resource=resource)
+    except HTTPException as e:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="assets",
+                target_id=asset_id,
+                details=f"Unassignment denied: {e.detail}",
+                level=LogLevel.CRITICAL
+            )
+        raise
+    
+    if asset.department_id is None and asset.responsible_officer_id is None:
+        raise HTTPException(status_code=400, detail="Asset not currently assigned")
+    
+    old_assignment = {
+        "department_id": asset.department_id,
+        "responsible_officer_id": asset.responsible_officer_id
+    }
+    
+    asset.department_id = None
+    asset.responsible_officer_id = None
+    
+    try:
+        db.commit()
+        db.refresh(asset)
+        
+        lifecycle_event = AssetLifecycleEvents(
+            id=generate_id(60),
+            asset_id=asset_id,
+            event_type="unassigned",
+            performed_by=current_user.id,
+            details=old_assignment,
+            remarks=f"Asset unassigned by {current_user.first_name} {current_user.last_name}"
+        )
+        db.add(lifecycle_event)
+        db.commit()
+        
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.UPDATE,
+                target_table="assets",
+                target_id=asset_id,
+                details={"action": "unassigned", "previous_assignment": old_assignment},
+                level=LogLevel.INFO
+            )
+        
+        return {"detail": "Asset unassigned successfully"}
+        
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Unassignment failed due to database constraint")
+
+@router.put("/{asset_id}/reassign", status_code=status.HTTP_200_OK)
+async def reassign_an_asset_to_user(asset_id: str, resp: AssignAssetUserDep,current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    
+    asset = db.query(Assets).filter(Assets.id == asset_id).first()
+    if not asset:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.UPDATE,
+                target_table="assets",
+                target_id=asset_id,
+                details="Asset not found for reassignment",
+                level=LogLevel.INFO
+            )
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    try:
+        resource = build_asset_resource(asset)
+        check_full_permission(current_user, "asset", "reassign", db, resource=resource)
+    except HTTPException as e:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="assets",
+                target_id=asset_id,
+                details=f"Reassignment denied: {e.detail}",
+                level=LogLevel.CRITICAL
+            )
+        raise
+    
+    if not resp.user_id and not resp.dept_id:
+        raise HTTPException(status_code=400, detail="User or department must be specified")
+    
+    old_assignment = {
+        "department_id": asset.department_id,
+        "responsible_officer_id": asset.responsible_officer_id
+    }
+    
+    usr = None
+    dep = None
+    new_assignment_details = {}
+    
+    if resp.user_id and resp.dept_id:
+        usr = db.query(User).filter(User.id == resp.user_id).first()
+        dep = db.query(Departments).filter(Departments.dept_id == resp.dept_id).first()
+        
+        if not usr or not dep:
+            raise HTTPException(status_code=400, detail="User or department not found")
+        
+        if usr.department_id != resp.dept_id:
+            raise HTTPException(status_code=400, detail="User not in specified department")
+        
+        asset.responsible_officer_id = resp.user_id
+        asset.department_id = resp.dept_id
+        new_assignment_details = {
+            "type": "user_and_department",
+            "user_name": f"{usr.first_name} {usr.last_name}",
+            "department_name": dep.name
+        }
+    
+    elif resp.user_id:
+        usr = db.query(User).filter(User.id == resp.user_id).first()
+        if not usr:
+            raise HTTPException(status_code=400, detail="User not found")
+        
+        asset.responsible_officer_id = resp.user_id
+        asset.department_id = usr.department_id
+        new_assignment_details = {
+            "type": "user_only",
+            "user_name": f"{usr.first_name} {usr.last_name}",
+            "department_id": usr.department_id
+        }
+    
+    elif resp.dept_id:
+        dep = db.query(Departments).filter(Departments.dept_id == resp.dept_id).first()
+        if not dep:
+            raise HTTPException(status_code=400, detail="Department not found")
+        
+        asset.department_id = resp.dept_id
+        asset.responsible_officer_id = None
+        new_assignment_details = {
+            "type": "department_only",
+            "department_name": dep.name
+        }
+    
+    try:
+        db.commit()
+        db.refresh(asset)
+        
+        lifecycle_event = AssetLifecycleEvents(
+            id=generate_id(60),
+            asset_id=asset_id,
+            event_type="reassigned",
+            performed_by=current_user.id,
+            details={
+                "old_assignment": old_assignment,
+                "new_assignment": new_assignment_details
+            },
+            remarks=f"Asset reassigned by {current_user.first_name} {current_user.last_name}"
+        )
+        db.add(lifecycle_event)
+        db.commit()
+        
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.UPDATE,
+                target_table="assets",
+                target_id=asset_id,
+                details={
+                    "action": "reassigned",
+                    "old_assignment": old_assignment,
+                    "new_assignment": new_assignment_details
+                },
+                level=LogLevel.INFO
+            )
+        
+        return {"detail": "Asset reassigned successfully", "assignment": new_assignment_details}
+        
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Reassignment failed due to database constraint")
+
+
+@router.get("/{asset_id}/assignment-history")
+async def get_assignment_hist(asset_id: str,
+                            current_user: User = Depends(get_current_user),
+                            db: Session = Depends(get_db)):
+    
+    if not check_simple_permission(current_user, "asset", "read"):
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="assets",
+                target_id=asset_id,
+                details="Attempt to view assignment history without permission",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+    asset = db.query(Assets).filter(Assets.id == asset_id).first()
+    if not asset:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.VIEW,
+                target_table="assets",
+                target_id=asset_id,
+                details="Asset not found for assignment history",
+                level=LogLevel.INFO
+            )
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    assignment_events = (
+        db.query(AssetLifecycleEvents)
+        .filter(
+            AssetLifecycleEvents.asset_id == asset_id,
+            AssetLifecycleEvents.event_type.in_(["assigned", "unassigned", "reassigned"])
+        )
+        .order_by(AssetLifecycleEvents.event_date.desc())
+        .all()
+    )
+    
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.VIEW,
+            target_table="assets",
+            target_id=asset_id,
+            details={"view": "assignment_history", "events_count": len(assignment_events)},
+            level=LogLevel.INFO
+        )
+    
+    return assignment_events
+
+@router.get("/m/myassets",status_code=200)
+async def list_user_assigned_assets(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    
+    user_assets = db.query(Assets).filter(Assets.responsible_officer_id == current_user.id).all()
+    
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.VIEW,
+            target_table="assets",
+            target_id=None,
+            details={"view": "my_assigned_assets", "count": len(user_assets)},
+            level=LogLevel.INFO
+        )
+    
+    return user_assets
+    
+@router.get("/assignments/all")
+async def list_all_assignments(current_user: User = Depends(get_current_user),
+                             db: Session = Depends(get_db)):
+    
+    if not check_simple_permission(current_user, "asset", "read"):
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="assets",
+                target_id=None,
+                details="Attempt to list all assignments without permission",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+    assigned_assets = (
+        db.query(Assets)
+        .filter(
+            (Assets.responsible_officer_id.isnot(None)) |
+            (Assets.department_id.isnot(None))
+        )
+        .all()
+    )
+    
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.VIEW,
+            target_table="assets",
+            target_id=None,
+            details={"view": "all_assignments", "count": len(assigned_assets)},
+            level=LogLevel.INFO
+        )
+    
+    return assigned_assets
+
+@router.get("/assignments/unassigned")
+async def list_unassigned_assets(current_user: User = Depends(get_current_user),
+                               db: Session = Depends(get_db)):
+    
+    if not check_simple_permission(current_user, "asset", "read"):
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="assets",
+                target_id=None,
+                details="Attempt to list unassigned assets without permission",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+    unassigned_assets = (
+        db.query(Assets)
+        .filter(
+            Assets.responsible_officer_id.is_(None),
+            Assets.department_id.is_(None)
+        )
+        .all()
+    )
+    
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.VIEW,
+            target_table="assets",
+            target_id=None,
+            details={"view": "unassigned_assets", "count": len(unassigned_assets)},
+            level=LogLevel.INFO
+        )
+    
+    return unassigned_assetsfrom fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import or_, func, desc, asc
+from typing import  Optional, Dict
+from sqlalchemy.exc import IntegrityError
+
+import uuid
+
+from decimal import Decimal
+from ..database import get_db
+from ..models import User, Departments,Assets, AssetLifecycleEvents
+from ..schemas.assets import (
+    AssetCreate, AssetUpdate, AssetResponse, AssetListResponse,
+    AssetSearchParams, AssetStatusUpdate
+)
+from ..asset_utils import (
+    validate_category_attributes,
+    calculate_depreciation,
+    generate_tag_number,get_required_fields,StandardAssetAttributes,LandAttributes,BuildingAttributes
+)
+
+from ..utilities import get_current_user,generate_id
+
+router = APIRouter(
+    prefix="/api/v1/assets",
+    tags=["Assets CRUD"]
+    )
+
+
+def create_lifecycle_event(
+    db: Session, 
+    asset_id: str, 
+    event_type: str, 
+    user_id: str, 
+    details: Optional[Dict] = None,
+    remarks: Optional[str] = None
+):
+
+    event = AssetLifecycleEvents(
+        asset_id=asset_id,
+        event_type=event_type,
+        performed_by=user_id,
+        details=details or {},
+        remarks=remarks
+    )
+    db.add(event)
+    return event
+
+def gen_asset_tag(db: Session, category: str, department_id: str) -> str:
+    dept = db.query(Departments).filter(Departments.dept_id == department_id).first()
+    dept_code = dept.name[:3].upper() if dept else "DEP"
+    
+    # Get nxt seq no
+    last_asset = db.query(Assets).filter(
+        Assets.department_id == department_id,
+        Assets.category == category,
+        Assets.is_deleted == False
+    ).count()
+    
+    sequence = last_asset + 1
+    return generate_tag_number(category, dept_code, sequence)
+
+
+
+
+@router.post("/")# response_model=AssetResponse)
+async def create_a_new_asset(asset_data: AssetCreate,db: Session = Depends(get_db),current_user: User = Depends(get_current_user)):
+
+    if asset_data.specific_attributes:
+        try:
+            validated_attrs = validate_category_attributes(
+                asset_data.category, 
+                asset_data.specific_attributes
+            )
+            asset_data.specific_attributes = validated_attrs
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    
+    if not asset_data.tag_number:
+        asset_data.tag_number = gen_asset_tag(
+            db, asset_data.category, asset_data.department_id
+        )
+
+    existing_asset = db.query(Assets).filter(Assets.tag_number == asset_data.tag_number, Assets.is_deleted == False).first()
+    if existing_asset:
+        raise HTTPException(status_code=400, detail="Tag number already exists")
+    
+    asset = Assets(id=str(uuid.uuid4()), created_by=current_user.id, **asset_data.dict())
+    
+    if asset.acquisition_cost and asset.depreciation_rate and asset.acquisition_date:
+
+        depreciation = calculate_depreciation(asset.acquisition_cost, asset.depreciation_rate, asset.acquisition_date)
+        asset.current_value = depreciation["net_book_value"]
+    else:
+        asset.current_value = asset.acquisition_cost
+    try:
+        db.add(asset)
+        # db.refresh(asset)  # Get the ID
+    except IntegrityError:
+        raise HTTPException(status_code=400, detail="Department Does not exist")
+
+    #like logging
+    # create_lifecycle_event(
+        
+    #     db, asset.id, "created", current_user.id,id = generate_id(),
+    #     details={"category": asset.category, "initial_value": str(asset.acquisition_cost)},
+    #     remarks="Asset created in system"
+    # )
+    
+    db.commit()
+    db.refresh(asset)
+    
+    return asset
+
+
+
+
+@router.get("/categories", status_code=200)
+def list_asset_categories_simple():   
+    categories = {
+        "Standard Assets": StandardAssetAttributes,
+        "Land": LandAttributes,
+        "Buildings and building improvements": BuildingAttributes,
+    } 
+    result = {}
+    for c_name, schema_class in categories.items():
+        required_fields = get_required_fields(c_name)
+        
+        all = list(schema_class.__annotations__.keys())
+        
+        result[c_name] = {
+            "required_fields": required_fields,
+            "all_fields": all
+        }
+    return result
+
+
+@router.get("/", response_model=AssetListResponse)
+async def list_assets_search_func(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    department_id: Optional[str] = None,
+    search: Optional[str] = None,
+    db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    query = db.query(Assets).filter(Assets.is_deleted == False)
+
+    if category:
+        query = query.filter(Assets.category == category)
+    if status:
+        query = query.filter(Assets.status == status)
+    if department_id:
+        query = query.filter(Assets.department_id == department_id)
+    if search:
+        search_term = f"%{search}%"
+        query = query.filter(
+            or_(
+                Assets.description.ilike(search_term),
+                Assets.tag_number.ilike(search_term),
+                Assets.serial_number.ilike(search_term),
+                Assets.location.ilike(search_term)
+            )
+        )
+    
+    total = query.count()
+    offset = (page - 1) * size
+    assets = query.options(
+        joinedload(Assets.department),
+        joinedload(Assets.responsible_officer)
+    ).offset(offset).limit(size).all()
+    
+    total_pages = (total + size - 1) // size
+    
+    return AssetListResponse(assets=assets, total=total, page=page, size=size, total_pages=total_pages)
+
+@router.get("/{asset_id}", response_model=AssetResponse)
+async def get_asset_by_id(
+    asset_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):  
+    asset = db.query(Assets).options(
+        joinedload(Assets.department),
+        joinedload(Assets.responsible_officer)
+    ).filter(Assets.id == asset_id, Assets.is_deleted == False).first()
+    
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    return asset
+
+@router.put("/{asset_id}", response_model=AssetResponse)
+async def update_asset(asset_id: str, asset_data: AssetUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):    
+    asset = db.query(Assets).filter(Assets.id == asset_id, Assets.is_deleted == False).first()
+    
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    if asset_data.specific_attributes:
+        try:
+            validated_attrs = validate_category_attributes(
+                asset.category, 
+                asset_data.specific_attributes
+            )
+            asset_data.specific_attributes = validated_attrs
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    
+    changes = {}
+    update_data = asset_data.dict(exclude_none=True)
+    
+    for field, nval in update_data.items():
+        oval = getattr(asset, field)
+        if oval != nval:
+            changes[field] = {"old": str(oval), "new": str(nval)}
+            setattr(asset, field, nval)
+    
+    # Recalculate depreciation if changes
+    if any(field in changes for field in ['acquisition_cost', 'depreciation_rate', 'acquisition_date']):
+        if asset.acquisition_cost and asset.depreciation_rate and asset.acquisition_date:
+            depreciation = calculate_depreciation(asset.acquisition_cost,  asset.depreciation_rate,  asset.acquisition_date)
+            asset.current_value = depreciation["net_book_value"]
+            changes['current_value'] = {"new": str(asset.current_value)}
+    
+    if changes:
+        create_lifecycle_event(
+            db, asset.id, "updated", current_user.id,
+            details={"changes": changes},
+            remarks="Asset information updated"
+        )
+    
+    db.commit()
+    db.refresh(asset)
+    
+    return asset
+
+@router.patch("/{asset_id}/status", response_model=AssetResponse)
+async def update_asset_status(asset_id: str, status_data: AssetStatusUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+
+    asset = db.query(Assets).filter(Assets.id == asset_id, Assets.is_deleted == False).first()
+
+
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    old_status = asset.status
+    asset.status = status_data.status
+    
+    create_lifecycle_event(db, asset.id, "status_changed", current_user.id,
+        details={
+            "old_status": old_status,
+            "new_status": status_data.status
+        },
+        remarks=status_data.remarks or f"Status changed from {old_status} to {status_data.status}"
+    )
+    
+    db.commit()
+    db.refresh(asset)
+    
+    return asset
+
+@router.delete("/{asset_id}")
+async def delete_asset(asset_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    asset = db.query(Assets).filter(Assets.id == asset_id, Assets.is_deleted == False).first()
+    
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    asset.is_deleted = True
+    
+    create_lifecycle_event(db, asset.id, "deleted", current_user.id, remarks="Asset deleted from system")
+    db.commit()
+    
+    return {"message": "Asset deleted successfully"}
+
+@router.get("/search/advanced", response_model=AssetListResponse)
+async def advanced_asset_search_adm(params: AssetSearchParams = Depends(),db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+ 
+    query = db.query(Assets).filter(Assets.is_deleted == False)
+
+    if params.query:
+        search_term = f"%{params.query}%"
+        query = query.filter(
+            or_(
+                Assets.description.ilike(search_term),
+                Assets.tag_number.ilike(search_term),
+                Assets.serial_number.ilike(search_term),
+                Assets.location.ilike(search_term)
+            )
+        )
+    
+    if params.category:
+        query = query.filter(Assets.category == params.category)
+    if params.status:
+        query = query.filter(Assets.status == params.status)
+    if params.condition:
+        query = query.filter(Assets.condition == params.condition)
+    if params.department_id:
+        query = query.filter(Assets.department_id == params.department_id)
+    if params.responsible_officer_id:
+        query = query.filter(Assets.responsible_officer_id == params.responsible_officer_id)
+    if params.location:
+        query = query.filter(Assets.location.ilike(f"%{params.location}%"))
+    if params.min_value:
+        query = query.filter(Assets.current_value >= params.min_value)
+    if params.max_value:
+        query = query.filter(Assets.current_value <= params.max_value)
+    if params.acquisition_date_from:
+        query = query.filter(Assets.acquisition_date >= params.acquisition_date_from)
+    if params.acquisition_date_to:
+        query = query.filter(Assets.acquisition_date <= params.acquisition_date_to)
+    
+    sort_column = getattr(Assets, params.sort_by, Assets.created_at)
+    if params.sort_order == "asc":
+        query = query.order_by(asc(sort_column))
+    else:
+        query = query.order_by(desc(sort_column))
+    
+    total = query.count()
+    
+    offset = (params.page - 1) * params.size
+    assets = query.options(joinedload(Assets.department),joinedload(Assets.responsible_officer)).offset(offset).limit(params.size).all()
+    
+    total_pages = (total + params.size - 1) // params.size
+    
+    return AssetListResponse(assets=assets, total=total, page=params.page, size=params.size, total_pages=total_pages)
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from datetime import datetime, date
+from typing import List
+import uuid
+from ..models import Assets,User,AssetDisposals,AssetStatus,DisposalStatus
+from ..utilities import get_current_user
+from ..database import get_db
+from ..schemas.maintain_dispose import DisposalApproveReq,DisposalExecuteReq,DisposalInitiateReq,DisposalResp,DisposalScheduleReq ,DisposalUndoReq,DisposalHistResp
+
+router = APIRouter(
+    prefix="/api/v1/assets",
+    tags=["Assets Disposal"]
+    )
+@router.post("/{asset_id}/disposal/initiate", status_code=201, response_model=DisposalResp)
+async def init_disposal(asset_id: str, req: DisposalInitiateReq, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    asset = db.query(Assets).filter(Assets.id == asset_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="asset not found")
+    
+    disposal = AssetDisposals(
+        id=str(uuid.uuid4()),
+        asset_id=asset_id,
+        disposal_method="collected by garbage collection services",
+        remarks=req.reason,
+        status="initiated"
+    )
+    
+    db.add(disposal)
+    db.commit()
+    db.refresh(disposal)
+    
+    return {"msg": "disposal initiated"}
+
+@router.post("/{asset_id}/disposal/schedule", status_code=200, response_model=DisposalResp)
+async def schedule_disposal(asset_id: str, req: DisposalScheduleReq, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    disposal = db.query(AssetDisposals).filter(AssetDisposals.asset_id == asset_id, AssetDisposals.status == "initiated").first()
+    if not disposal:
+        raise HTTPException(status_code=404, detail="disposal request not found")
+    
+    disposal.disposal_date = req.disposal_date
+    disposal.status = "scheduled"
+    if req.disposal_method:
+        disposal.disposal_method = req.disposal_method
+    
+    db.commit()
+    db.refresh(disposal)
+    
+    return {"msg": "disposal scheduled"}
+
+@router.post("/{asset_id}/disposal/approve", status_code=200, response_model=DisposalResp)
+async def approve_disposal(asset_id: str, req: DisposalApproveReq, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    disposal = db.query(AssetDisposals).filter(AssetDisposals.asset_id == asset_id, AssetDisposals.status == "scheduled").first()
+    if not disposal:
+        raise HTTPException(status_code=404, detail="scheduled disposal not found")
+    
+    disposal.status = "approved"
+    disposal.approved_by = curr_user.id
+    
+    db.commit()
+    db.refresh(disposal)
+    
+    return {"msg": "disposal approved"}
+
+@router.post("/{asset_id}/disposal/execute", status_code=200, response_model=DisposalResp)
+async def execute_disposal(asset_id: str, req: DisposalExecuteReq, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    disposal = db.query(AssetDisposals).filter(AssetDisposals.asset_id == asset_id, AssetDisposals.status == "approved").first()
+    if not disposal:
+        raise HTTPException(status_code=404, detail="approved disposal not found")
+    
+    disposal.status = "executed"
+    if req.proceeds_amount:
+        disposal.proceeds_amount = req.proceeds_amount
+    if req.disposal_cost:
+        disposal.disposal_cost = req.disposal_cost
+    if req.disposal_method:
+        disposal.disposal_method = req.disposal_method
+    if req.remarks:
+        disposal.remarks = req.remarks
+    
+    asset = db.query(Assets).filter(Assets.id == asset_id).first()
+    if asset:
+        asset.status = AssetStatus.DISPOSED
+        asset.disposal_date = disposal.disposal_date
+        asset.disposal_value = disposal.proceeds_amount
+        asset.disposal_method = disposal.disposal_method
+    
+    db.commit()
+    db.refresh(disposal)
+    
+    return {"msg": "disposal executed"}
+
+@router.post("/{asset_id}/disposal/undo", status_code=200, response_model=DisposalResp)
+async def undo_disposal(asset_id: str, req: DisposalUndoReq, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    disposal = db.query(AssetDisposals).filter(AssetDisposals.asset_id == asset_id, AssetDisposals.status == "executed").first()
+    if not disposal:
+        raise HTTPException(status_code=404, detail="executed disposal not found")
+    
+    disposal.status = "undone"
+    disposal.remarks = f"{disposal.remarks or ''} | UNDONE: {req.justification}"
+    
+    asset = db.query(Assets).filter(Assets.id == asset_id).first()
+    if asset:
+        asset.status = AssetStatus.OPERATIONAL
+        asset.disposal_date = None
+        asset.disposal_value = None
+        asset.disposal_method = None
+    
+    db.commit()
+    db.refresh(disposal)
+    
+    return {"msg": "disposal undone"}
+
+@router.get("/disposals", status_code=200, response_model=List[DisposalHistResp])
+async def get_all_disposals(dept_id: str = None, stat: str = None, start_date: date = None, end_date: date = None, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    q = db.query(AssetDisposals)
+    
+    if dept_id:
+        q = q.join(Assets).filter(Assets.department_id == dept_id)
+    if stat:
+        q = q.filter(AssetDisposals.status == stat)
+    if start_date:
+        q = q.filter(AssetDisposals.disposal_date >= start_date)
+    if end_date:
+        q = q.filter(AssetDisposals.disposal_date <= end_date)
+    
+    disposals = q.all()
+    return disposals
+
+@router.get("/{asset_id}/disposal/history", status_code=200, response_model=List[DisposalHistResp])
+async def get_disposal_hist(asset_id: str, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    hist = db.query(AssetDisposals).filter(AssetDisposals.asset_id == asset_id).all()
+    return histfrom fastapi import APIRouter, Depends,HTTPException
+from sqlalchemy.orm import Session
+from ..database import get_db
+from ..models import Assets,AssetStatus,User,AssetLifecycleEvents
+from ..schemas.assets import AssetResponse
+from sqlalchemy import desc
+from .a_crude import create_lifecycle_event
+from ..utilities import get_current_user
+from typing import List
+from ..schemas.assets import AssetLifecycleEventResponse
+
+
+router = APIRouter(
+    prefix="/api/v1/assets/life",
+    tags=["Assets Lifecycle"]
+    )
+
+@router.post("/{asset_id}/activate", response_model=AssetResponse)
+async def activate_asset(asset_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    asset = db.query(Assets).filter(Assets.id == asset_id, Assets.is_deleted == False).first()
+    
+    if not asset:
+     
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    if asset.status == AssetStatus.OPERATIONAL:
+        raise HTTPException(status_code=400, detail="Asset is already operational")
+    
+    asset.status = AssetStatus.OPERATIONAL
+    
+    create_lifecycle_event(db, asset.id, "activated", current_user.id,remarks="Asset activated for operational use")
+    
+    db.commit()
+    db.refresh(asset)
+    
+    return asset
+
+@router.post("/{asset_id}/deactivate", response_model=AssetResponse)  
+async def deactivate_asset(asset_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    asset = db.query(Assets).filter(Assets.id == asset_id, Assets.is_deleted == False).first()
+    
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    if asset.status in [AssetStatus.DISPOSED, AssetStatus.RETIRED]:
+        raise HTTPException(status_code=400, detail="Cannot deactivate disposed or retired asset")
+    
+    asset.status = AssetStatus.IMPAIRED
+    
+    create_lifecycle_event(db, asset.id, "deactivated", current_user.id,remarks="Asset deactivated from operational use")
+    
+    db.commit()
+    db.refresh(asset)
+    
+    return asset
+
+@router.post("/{asset_id}/mark-disposal", response_model=AssetResponse)
+async def mark_asset_for_disposal( asset_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    asset = db.query(Assets).filter(Assets.id == asset_id,Assets.is_deleted == False).first()
+    
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    if asset.status in [AssetStatus.DISPOSED, AssetStatus.HELD_FOR_SALE]:
+        raise HTTPException(status_code=400, detail="Asset already marked for disposal")
+    
+    asset.status = AssetStatus.HELD_FOR_SALE
+    
+    create_lifecycle_event(db, asset.id, "marked_for_disposal", current_user.id,remarks="Asset marked for disposal")
+    
+    db.commit()
+    db.refresh(asset)
+    
+    return asset
+
+
+@router.get("/{asset_id}/lifecycle", response_model=List[AssetLifecycleEventResponse])
+async def get_asset_lifecycle_adm(asset_id: str,db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
+):
+    """Get complete asset lifecycle history"""
+    
+    asset = db.query(Assets).filter(Assets.id == asset_id,Assets.is_deleted == False).first()
+    
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    events = db.query(AssetLifecycleEvents).filter(AssetLifecycleEvents.asset_id == asset_id).order_by(desc(AssetLifecycleEvents.event_date)).all()
+    
+    return eventsfrom fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from datetime import datetime, date
+from typing import List
+import uuid
+from ..models import MaintenanceRequests,Assets,User,AssetStatus, MaintenanceStatus, MaintenanceType,PriorityLevel, SeverityLevel,IssueCategory
+from..schemas.maintain_dispose import MaintenanceApproveReq,MaintenanceCompleteReq,MaintenanceCompleteResp,MaintenanceHistResp,MaintenanceInitiateReq,MaintenanceResp,MaintenanceScheduleReq,MaintenanceStartReq
+from ..utilities import get_current_user
+from ..services.policy_eval import check_simple_permission,require_specific_role
+from ..schemas.main import LogLevel, ActionType
+from ..services.logger_queue import enqueue_log
+from ..system_vars import sys_logger
+
+from ..database import get_db
+
+router = APIRouter(
+    prefix="/api/v1/assets",
+    tags=["Assets Maintainance"]
+    )
+
+
+@router.post("/{asset_id}/maintenance/initiate", status_code=201, response_model=MaintenanceResp)
+async def init_maint_req(asset_id: str, req: MaintenanceInitiateReq, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not check_simple_permission(curr_user, "maintenance", "create"):
+        if sys_logger:
+            await enqueue_log(
+                user_id=curr_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="maintenance_requests",
+                target_id=None,
+                details=f"Unauthorized attempt to initiate maintenance for asset {asset_id}",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    asset = db.query(Assets).filter(Assets.id == asset_id).first()
+    if not asset:
+        if sys_logger:
+            await enqueue_log(
+                user_id=curr_user.id,
+                action=ActionType.VIEW,
+                target_table="assets",
+                target_id=asset_id,
+                details="Asset not found when initiating maintenance",
+                level=LogLevel.INFO
+            )
+        raise HTTPException(status_code=404, detail="asset not found")
+    
+    asset.status = AssetStatus.UNDER_MAINTENANCE
+
+    maint_req = MaintenanceRequests(
+        id=str(uuid.uuid4()),
+        asset_id=asset_id,
+        requested_by=curr_user.id,
+        issue_type=req.issue_type,
+        description=req.description,
+        status="initiated",
+        maintenance_type=req.maintenance_type or MaintenanceType.CORRECTIVE,
+        issue_category=req.issue_category or IssueCategory.OTHER,
+        priority=req.priority or PriorityLevel.MEDIUM,
+        severity=req.severity or SeverityLevel.MINOR
+    )
+
+    db.add(maint_req)
+    db.commit()
+    db.refresh(asset)
+    db.refresh(maint_req)
+
+    if sys_logger:
+        await enqueue_log(
+            user_id=curr_user.id,
+            action=ActionType.CREATE,
+            target_table="maintenance_requests",
+            target_id=maint_req.id,
+            details={"route": "initiate", "asset_id": asset_id, "payload": req.dict(exclude_unset=True)},
+            level=LogLevel.INFO
+        )
+
+    return {"msg": "maintenance initiated"}
+
+@router.post("/{asset_id}/maintenance/schedule", status_code=200, response_model=MaintenanceResp)
+async def schedule_maint(asset_id: str, req: MaintenanceScheduleReq, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not check_simple_permission(curr_user, "maintenance", "update"):
+        if sys_logger:
+            await enqueue_log(
+                user_id=curr_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="maintenance_requests",
+                target_id=None,
+                details=f"Unauthorized attempt to schedule maintenance for asset {asset_id}",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    maint_req = db.query(MaintenanceRequests).filter(MaintenanceRequests.asset_id == asset_id, MaintenanceRequests.status == "initiated").first()
+    if not maint_req:
+        raise HTTPException(status_code=404, detail="maintenance request not found")
+    
+    maint_req.maintenance_date = req.maintenance_date
+    maint_req.status = "scheduled"
+    if req.assigned_to:
+        maint_req.assigned_to = req.assigned_to
+    
+    if req.status == "under_maintenance":
+        asset = db.query(Assets).filter(Assets.id == asset_id).first()
+        if asset:
+            asset.status = AssetStatus.UNDER_MAINTENANCE
+    
+    db.commit()
+    db.refresh(maint_req)
+
+    if sys_logger:
+        await enqueue_log(
+            user_id=curr_user.id,
+            action=ActionType.UPDATE,
+            target_table="maintenance_requests",
+            target_id=maint_req.id,
+            details={"route": "schedule", "payload": req.dict(exclude_unset=True)},
+            level=LogLevel.INFO
+        )
+    
+    return {"msg": "maintenance scheduled"}
+
+
+@router.post("/{asset_id}/maintenance/approve", status_code=200, response_model=MaintenanceResp)
+async def approve_maint(asset_id: str, req: MaintenanceApproveReq, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    state, det = require_specific_role(curr_user, ["maintenance_manager"])
+    if not state:
+        if sys_logger:
+            await enqueue_log(
+                user_id=curr_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="maintenance_requests",
+                target_id=None,
+                details=f"Unauthorized attempt to approve maintenance for asset {asset_id}: {det}",
+                level=LogLevel.CRITICAL
+            )
+        raise HTTPException(status_code=403, detail=det)
+
+    maint_req = db.query(MaintenanceRequests).filter(MaintenanceRequests.asset_id == asset_id, MaintenanceRequests.status == "scheduled").first()
+    if not maint_req:
+        raise HTTPException(status_code=404, detail="scheduled maintenance not found")
+    
+    maint_req.status = "approved"
+    db.commit()
+    db.refresh(maint_req)
+
+    if sys_logger:
+        await enqueue_log(
+            user_id=curr_user.id,
+            action=ActionType.UPDATE,
+            target_table="maintenance_requests",
+            target_id=maint_req.id,
+            details={"route": "approve"},
+            level=LogLevel.INFO
+        )
+    
+    return {"msg": "maintenance approved"}
+
+
+@router.post("/{asset_id}/maintenance/start", status_code=200, response_model=MaintenanceResp)
+async def start_maint(asset_id: str, req: MaintenanceStartReq, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    allowed = curr_user.id == db.query(Assets).filter(Assets.id == asset_id).first().owner_id or check_simple_permission(curr_user, "asset", "maintain")
+    if not allowed:
+        if sys_logger:
+            await enqueue_log(
+                user_id=curr_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="maintenance_requests",
+                target_id=None,
+                details=f"Unauthorized attempt to start maintenance for asset {asset_id}",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    maint_req = db.query(MaintenanceRequests).filter(MaintenanceRequests.asset_id == asset_id, MaintenanceRequests.status == "approved").first()
+    if not maint_req:
+        raise HTTPException(status_code=404, detail="approved maintenance not found")
+    
+    maint_req.status = "in_progress"
+    db.commit()
+    db.refresh(maint_req)
+
+    if sys_logger:
+        await enqueue_log(
+            user_id=curr_user.id,
+            action=ActionType.UPDATE,
+            target_table="maintenance_requests",
+            target_id=maint_req.id,
+            details={"route": "start"},
+            level=LogLevel.INFO
+        )
+    
+    return {"msg": "maintenance started"}
+
+
+@router.post("/{asset_id}/maintenance/complete", status_code=200, response_model=MaintenanceCompleteResp)
+async def complete_maint(asset_id: str, req: MaintenanceCompleteReq, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    allowed = curr_user.id == db.query(Assets).filter(Assets.id == asset_id).first().owner_id or check_simple_permission(curr_user, "asset", "maintain")
+    if not allowed:
+        if sys_logger:
+            await enqueue_log(user_id=curr_user.id, action=ActionType.SUSPICIOUS_ACTIVITY, target_table="maintenance_requests", target_id=None, details=f"Unauthorized attempt to complete maintenance for asset {asset_id}", level=LogLevel.WARNING)
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    maint_req = db.query(MaintenanceRequests).filter(MaintenanceRequests.asset_id == asset_id, MaintenanceRequests.status == "in_progress").first()
+    if not maint_req:
+        raise HTTPException(status_code=404, detail="active maintenance not found")
+
+    maint_req.status = "completed"
+    maint_req.completed_at = datetime.now()
+    if maint_req.started_at:
+        maint_req.duration = maint_req.completed_at - maint_req.started_at
+    maint_req.cost = req.cost
+
+    maint_req.outcome = req.outcome
+    maint_req.notes = req.notes
+
+    asset = db.query(Assets).filter(Assets.id == asset_id).first()
+    if asset and req.outcome == "fixed":
+        asset.status = AssetStatus.OPERATIONAL
+
+    db.commit()
+    db.refresh(maint_req)
+
+    if sys_logger:
+        await enqueue_log(user_id=curr_user.id, action=ActionType.UPDATE, target_table="maintenance_requests", target_id=maint_req.id, details={"route": "complete", "payload": req.dict(exclude_unset=True)}, level=LogLevel.INFO)
+
+    return {
+        "id": maint_req.id,
+        "asset_id": maint_req.asset_id,
+        "status": maint_req.status,
+        "started_at": maint_req.started_at,
+        "completed_at": maint_req.completed_at,
+        "duration": str(maint_req.duration) if maint_req.duration else None,
+        "cost": float(maint_req.cost) if maint_req.cost else None,
+        "paid_by": maint_req.paid_by,
+        "outcome": maint_req.outcome,
+        "notes": maint_req.notes
+    }
+@router.post("/{asset_id}/maintenance/complete", status_code=200, response_model=MaintenanceCompleteResp)
+async def complete_maint(asset_id: str, req: MaintenanceCompleteReq, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    allowed = curr_user.id == db.query(Assets).filter(Assets.id == asset_id).first().owner_id or check_simple_permission(curr_user, "asset", "maintain")
+    if not allowed:
+        if sys_logger:
+            await enqueue_log(user_id=curr_user.id, action=ActionType.SUSPICIOUS_ACTIVITY, target_table="maintenance_requests", target_id=None, details=f"Unauthorized attempt to complete maintenance for asset {asset_id}", level=LogLevel.WARNING)
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    maint_req = db.query(MaintenanceRequests).filter(MaintenanceRequests.asset_id == asset_id, MaintenanceRequests.status == "in_progress").first()
+    if not maint_req:
+        raise HTTPException(status_code=404, detail="active maintenance not found")
+
+    maint_req.status = "completed"
+    maint_req.completed_at = datetime.now()
+    if maint_req.started_at:
+        maint_req.duration = maint_req.completed_at - maint_req.started_at
+    maint_req.cost = req.cost
+    maint_req.paid_by = req.paid_by
+    maint_req.outcome = req.outcome
+    maint_req.notes = req.notes
+
+    asset = db.query(Assets).filter(Assets.id == asset_id).first()
+    if asset and req.outcome == "fixed":
+        asset.status = AssetStatus.OPERATIONAL
+
+    db.commit()
+    db.refresh(maint_req)
+
+    if sys_logger:
+        await enqueue_log(user_id=curr_user.id, action=ActionType.UPDATE, target_table="maintenance_requests", target_id=maint_req.id, details={"route": "complete", "payload": req.dict(exclude_unset=True)}, level=LogLevel.INFO)
+
+    return {
+        "id": maint_req.id,
+        "asset_id": maint_req.asset_id,
+        "status": maint_req.status,
+        "started_at": maint_req.started_at,
+        "completed_at": maint_req.completed_at,
+        "duration": str(maint_req.duration) if maint_req.duration else None,
+        "cost": float(maint_req.cost) if maint_req.cost else None,
+        "paid_by": maint_req.paid_by,
+        "outcome": maint_req.outcome,
+        "notes": maint_req.notes
+    }
+
+@router.get("/{asset_id}/maintenance/history", status_code=200, response_model=List[MaintenanceHistResp])
+async def get_maint_hist(asset_id: str, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not check_simple_permission(curr_user, "maintenance", "read"):
+        if sys_logger:
+            await enqueue_log(
+                user_id=curr_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="maintenance_requests",
+                target_id=None,
+                details=f"Unauthorized attempt to fetch maintenance history for asset {asset_id}",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    hist = db.query(MaintenanceRequests).filter(MaintenanceRequests.asset_id == asset_id).all()
+
+    if sys_logger:
+        await enqueue_log(
+            user_id=curr_user.id,
+            action=ActionType.VIEW,
+            target_table="maintenance_requests",
+            target_id=None,
+            details={"route": "history", "asset_id": asset_id},
+            level=LogLevel.INFO
+        )
+    return hist
+
+
+@router.get("/maintenance/upcoming", status_code=200, response_model=List[MaintenanceHistResp])
+async def get_upcoming_maint(dept_id: str = None, start_date: date = None, end_date: date = None, curr_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not check_simple_permission(curr_user, "maintenance", "read"):
+        if sys_logger:
+            await enqueue_log(
+                user_id=curr_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="maintenance_requests",
+                target_id=None,
+                details="Unauthorized attempt to fetch upcoming maintenance",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    q = db.query(MaintenanceRequests).filter(MaintenanceRequests.status.in_(["scheduled", "approved"]))
+    if dept_id:
+        q = q.join(Assets).filter(Assets.department_id == dept_id)
+    if start_date:
+        q = q.filter(MaintenanceRequests.maintenance_date >= start_date)
+    if end_date:
+        q = q.filter(MaintenanceRequests.maintenance_date <= end_date)
+    
+    upcoming = q.all()
+
+    if sys_logger:
+        await enqueue_log(
+            user_id=curr_user.id,
+            action=ActionType.VIEW,
+            target_table="maintenance_requests",
+            target_id=None,
+            details={"route": "upcoming", "dept_id": dept_id, "range": [start_date, end_date]},
+            level=LogLevel.INFO
+        )
+    return upcoming
+from fastapi import APIRouter,Depends
+from ..models import AssetStatus,AssetCondition,AssetCategory,User,MaintenanceType, IssueCategory,PriorityLevel,SeverityLevel,MaintenanceOutcome
+from typing import Dict,List
+from ..asset_utils import StandardAssetAttributes, LandAttributes,BuildingAttributes,get_required_fields,get_default_attributes
+from ..schemas.assets import CategoryInfo
+from ..utilities import get_current_user
+
+router = APIRouter(
+    prefix="/api/v1/assets/supp",
+    tags=["Assets Supporting routes"]
+    )
+
+@router.get("/assetstatus", status_code=200,response_model=Dict[str, str])
+async def list_asset_statuses(curr: User = Depends(get_current_user)):
+    
+    return {x.name: x.value for x in AssetStatus }
+
+@router.get("/assetcondition", status_code=200,response_model=Dict[str, str])
+async def list_asset_condition(curr: User = Depends(get_current_user)):
+    
+    return {x.name: x.value for x in AssetCondition}
+
+@router.get("/categories/newlist", status_code=200,response_model=Dict[str, str])
+async def list_categories_byname(curr: User = Depends(get_current_user)):
+
+
+    return {x.name: x.value for x in AssetCategory}
+
+
+@router.get("/categories/detailed", status_code=200)
+async def list_asset_categories_detailed(curr: User = Depends(get_current_user)):
+    categories = {
+        "Standard Assets": StandardAssetAttributes,
+        "Land": LandAttributes,
+        "Buildings and building improvements": BuildingAttributes,
+    }
+    
+    result = {}
+    
+    for category_name, schema_class in categories.items():
+        required_fields = get_required_fields(category_name)
+        
+        schema_instance = schema_class()
+        
+        if hasattr(schema_instance, '__fields__'):
+            all_fields = list(schema_instance.__fields__.keys())
+        elif hasattr(schema_instance, 'model_fields'):
+            all_fields = list(schema_instance.model_fields.keys())
+        else:
+            all_fields = list(schema_class.__annotations__.keys())
+        
+        field_details = {}
+        for field_name in all_fields:
+
+            field_type = schema_class.__annotations__.get(field_name, str)
+
+            type_str = str(field_type)
+            if "Optional" in type_str:
+                if hasattr(field_type, '__args__') and field_type.__args__:
+                    actual_type = field_type.__args__[0]
+                    type_name = getattr(actual_type, '__name__', str(actual_type))
+                else:
+                    type_name = "str"
+            else:
+                type_name = getattr(field_type, '__name__', str(field_type))
+            
+            field_details[field_name] = {
+                "type": type_name,
+                "required": field_name in required_fields,
+                "description": field_name.replace('_', ' ').title()
+            }
+        
+        result[category_name] = {
+            "required_fields": required_fields,
+            "all_fields": field_details,
+            "schema_name": schema_class.__name__
+        }
+    
+    return {
+        "message": "Asset categories and their fields",
+        "categories": result
+    }
+
+
+@router.get("/categories/info", response_model=List[CategoryInfo])
+async def get_asset_categories_info():
+    categories = [
+        {
+            "category": "Standard Assets",
+            "description": "General assets register for standard equipment and items",
+            "fields": [
+                {"field_name": "asset_description", "field_type": "string", "required": True},
+                {"field_name": "make_model", "field_type": "string", "required": False},
+                {"field_name": "serial_number", "field_type": "string", "required": False},
+                {"field_name": "responsible_officer", "field_type": "string", "required": False}
+            ],
+            "sample_attributes": get_default_attributes("Standard Assets")
+        },
+        {
+            "category": "Land",
+            "description": "Land register for land assets and properties",
+            "fields": [
+                {"field_name": "description_of_land", "field_type": "string", "required": True},
+                {"field_name": "size_hectares", "field_type": "decimal", "required": True},
+                {"field_name": "county", "field_type": "string", "required": True},
+                {"field_name": "lr_certificate_no", "field_type": "string", "required": False}
+            ],
+            "sample_attributes": get_default_attributes("Land")
+        },
+        {
+            "category": "Buildings and building improvements",
+            "description": "Buildings register for building assets and improvements",
+            "fields": [
+                {"field_name": "description_name_of_building", "field_type": "string", "required": True},
+                {"field_name": "type_of_building", "field_type": "string", "required": True},
+                {"field_name": "county", "field_type": "string", "required": True},
+                {"field_name": "no_of_floors", "field_type": "integer", "required": False}
+            ],
+            "sample_attributes": get_default_attributes("Buildings and building improvements")
+        }
+    ]
+    
+    return categories
+
+
+@router.get("/maintain/MaintenanceType",status_code=200,response_model=Dict[str, str])
+async def list_maintainance_types(curr: User = Depends(get_current_user)):
+
+    return {x.name: x.value for x in MaintenanceType}
+
+@router.get("/maintain/IssueCategory",status_code=200,response_model=Dict[str, str])
+async def list_issue_categories(curr: User = Depends(get_current_user)):
+
+    return {x.name: x.value for x in IssueCategory}
+@router.get("/maintain/PriorityLevel",status_code=200,response_model=Dict[str, str])
+async def list_priorrity_levels(curr: User = Depends(get_current_user)):
+
+    return {x.name: x.value for x in PriorityLevel}
+@router.get("/maintain/SeverityLevel",status_code=200,response_model=Dict[str, str])
+async def list_Severerity_level(curr: User = Depends(get_current_user)):
+
+    return {x.name: x.value for x in SeverityLevel}
+
+@router.get("/maintain/maintainanceoutcome",status_code=200,response_model=Dict[str, str])
+async def list_the_2_maint_outcomes(curr: User = Depends(get_current_user)):
+
+    return {x.name: x.value for x in MaintenanceOutcome}
+
+
+
+
+from fastapi import APIRouter, Depends,HTTPException
+from sqlalchemy.orm import Session,joinedload
+from ..models import Assets,User
+from ..database import get_db
+from ..schemas.assets import QRCodeResponse,AssetResponse,AssetLocationUpdate
+from ..utilities import get_current_user
+from datetime import datetime
+import base64
+import io
+import qrcode
+from .a_crude import create_lifecycle_event
+
+router = APIRouter(
+    prefix="/api/v1/assets",
+    tags=["Assets Tracking"]
+    )
+
+@router.post("/{asset_id}/generate-qr", response_model=QRCodeResponse)
+async def generate_asset_qr_code(asset_id: str,db: Session = Depends(get_db),current_user: User = Depends(get_current_user)):
+    asset = db.query(Assets).filter( Assets.id == asset_id, Assets.is_deleted == False).first()
+    
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    qr_data = {"asset_id": asset.id,"tag_number": asset.tag_number,"description": asset.description,"category": asset.category,"generated_at": datetime.now().isoformat()}
+    
+    qr_code_text = f"ASSET:{asset.id}|TAG:{asset.tag_number}|DESC:{asset.description}"
+
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(qr_code_text)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    buffer = io.BytesIO()
+    img.save(buffer, format='PNG')
+    qr_code_base64 = base64.b64encode(buffer.getvalue()).decode()
+    
+    asset.qr_code = qr_code_text
+    
+    create_lifecycle_event( db, asset.id, "qr_generated", current_user.id, details={"qr_data": qr_code_text}, remarks="QR code generated for asset")
+    
+    db.commit()  
+    return QRCodeResponse(qr_code_data=qr_code_text, qr_code_image_url=f"data:image/png;base64,{qr_code_base64}")
+
+@router.put("/{asset_id}/location", response_model=AssetResponse)
+async def update_asset_location(asset_id: str, location_data: AssetLocationUpdate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    
+    
+    asset = db.query(Assets).filter(Assets.id == asset_id,Assets.is_deleted == False).first() 
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    old_location = asset.location
+    asset.location = location_data.location
+    
+    create_lifecycle_event(db, asset.id, "location_changed", current_user.id,
+        details={
+            "old_location": old_location,
+            "new_location": location_data.location
+        },remarks=location_data.remarks or "Asset location updated" # remak
+    )
+    
+    db.commit()
+    db.refresh(asset)
+    
+    return asset
+
+# lookup 
+@router.get("/by-tag/{tag_number}", response_model=AssetResponse)
+async def get_asset_by_tag_no(tag_number: str,db: Session = Depends(get_db),current_user: User = Depends(get_current_user)):
+
+    asset = db.query(Assets).options(joinedload(Assets.department),joinedload(Assets.responsible_officer)
+    ).filter(
+        Assets.tag_number == tag_number,
+        Assets.is_deleted == False
+    ).first()
+    
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    return asset
+
+@router.get("/by-barcode/{barcode}", response_model=AssetResponse)
+async def get_asset_by_barcode(barcode: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    
+    asset = db.query(Assets).options( joinedload(Assets.department), joinedload(Assets.responsible_officer)
+    ).filter(
+        Assets.barcode == barcode,
+        Assets.is_deleted == False
+    ).first()
+    
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    return asset
+
+@router.get("/by-serial/{serial_number}", response_model=AssetResponse)
+async def get_asset_by_serial_no(
+    serial_number: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+
+    asset = db.query(Assets).options(joinedload(Assets.department),joinedload(Assets.responsible_officer)
+    ).filter(
+        Assets.serial_number == serial_number,
+        Assets.is_deleted == False
+    ).first()
+    
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    
+    return assetfrom fastapi import status, Depends,HTTPException,APIRouter
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
+from ..database import get_db
+from ..utilities import generate_id,get_current_user
+
+from ..schemas.assets import AssetTransfereInitiate,TransferStatusEnum,TransSearchParams
+from ..models import User, AssetTransfers,Assets
+from datetime import timezone, datetime
+
+router = APIRouter(
+    prefix="/api/v1/transfers",
+    tags=["Assets Transfers"]
+    )
+
+@router.post("/initiate", status_code=status.HTTP_200_OK)
+async def transfer_an_asset(det: AssetTransfereInitiate,curr_user : User = Depends(get_current_user),db: Session = Depends(get_db)):
+    
+    asset = db.query(Assets).filter(Assets.id == det.asset_id).first()
+    transfa = AssetTransfers(
+        id = generate_id(40),
+        asset_id = det.asset_id,
+        from_user_id = asset.responsible_officer_id,
+        to_user_id = det.to_user_id,
+        from_dept_id = asset.department_id,
+        to_dept_id = det.to_dept_id,
+
+        initiated_by = curr_user.id,
+        initiated_date = datetime.now(timezone.utc),
+        approved_by = None,
+        approval_date = None,
+        completed_date = None,
+
+        status = TransferStatusEnum.INITIATED,
+        transfer_reason = det.transfer_reason,
+        remarks = det.remarks,
+        )
+    db.add(transfa)
+    db.commit()
+    db.refresh(transfa)
+
+    return transfa
+
+
+@router.get("/",status_code=200)
+async def list_transfers_param( p : TransSearchParams = Depends() ,curr_user: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    """_summary_
+
+    Args:
+        u_from : from user id.
+        d_from : from department id.
+        u_to : to user id
+        d_to : department id destination
+        init_by : id of initializer
+        f_init_date : initialized from date 
+        t_init_date : initialized upto date
+        approv_by : who approved  id
+        f_approv_date : transferes aproved from date
+        t_approv_date : approved upto date
+        status : status of approval, [initiated,apptoved,rejected,completed,cancelled]
+
+    Returns:
+        List : of all transfers matching filter
+    """
+    
+    
+    res = db.query(AssetTransfers)
+    if p.u_from:
+        res = res.filter(AssetTransfers.from_user_id == p.u_from)
+    if p.d_from:
+        res = res.filter(AssetTransfers.from_dept_id == p.d_from)
+    if p.u_to: 
+        res = res.filter(AssetTransfers.to_user_id == p.u_to)
+    if p.d_to:
+        res = res.filter(AssetTransfers.to_dept_id == p.d_to)
+    if p.init_by:
+        res = res.filter(AssetTransfers.initiated_by == p.init_by)
+    if p.approv_by: 
+        res = res.filter(AssetTransfers.approved_by == p.approv_by)
+    if p.status:
+        res = res.filter(AssetTransfers.status == status)
+
+    if p.f_init_date and not p.t_init_date:
+        res = res.filter(AssetTransfers.initiated_date >= p.f_init_date)
+    elif p.t_init_date and not p.f_init_date:
+        res = res.filter(AssetTransfers.initiated_date <= p.t_init_date)
+    elif p.t_init_date and p.f_init_date:
+        res = res.filter(AssetTransfers.initiated_date.between(p.f_init_date,p.t_init_date))
+
+
+    if p.f_approv_date and not p.t_approv_date:
+        res = res.filter(AssetTransfers.approval_date >= p.f_approv_date)
+    elif p.t_approv_date and not p.f_approv_date:
+        res = res.filter(AssetTransfers.approval_date <= p.f_approv_date)
+    elif  p.t_approv_date and p.f_approv_date:
+        res = res.filter(AssetTransfers.approval_date.between(p.f_approv_date,p.f_approv_date))
+    return res
+
+@router.get("/{trans_id}",status_code=200)
+async def get_transfer_by_id(trans_id, curr: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    transf = db.query(AssetTransfers).filter(AssetTransfers.id == trans_id).first()
+    if not transf:
+        raise HTTPException(status_code=404, detail="transfer record not found")
+    return transf
+
+@router.post("/{trans_id}/approve",status_code=200)
+async def approve_a_transfer(trans_id,curr_user: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    transf = db.query(AssetTransfers).filter(AssetTransfers.id == trans_id).first()
+    if not transf:
+        raise HTTPException(status_code=404, detail="transfer record not found")
+    transf.status = TransferStatusEnum.APPROVED
+    db.commit()
+    db.refresh(transf)
+    return {"msg":"transfer approved"}
+
+
+@router.post("/{trans_id}/complete",status_code=200)
+async def approve_a_transfer(trans_id,curr_user: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    transf = db.query(AssetTransfers).filter(AssetTransfers.id == trans_id).first()
+    if not transf:
+        raise HTTPException(status_code=404, detail="transfer record not found")
+    transf.status = TransferStatusEnum.COMPLETED
+    db.commit()
+    db.refresh(transf)
+    return {"msg":"transfer completed"}
+
+
+@router.post("/{asset_id}/history",status_code=200)
+async def get_asset_transfer_hist(asset_id,curr_user: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    hist = db.query(AssetTransfers).filter(AssetTransfers.asset_id == asset_id).all()
+    return hist
+
+@router.post("/{trans_id}/reject")
+async def reject_transfer_request(trans_id,curr_user: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    transf = db.query(AssetTransfers).filter(AssetTransfers.id == trans_id).first()
+    if not transf:
+        raise HTTPException(status_code=404, detail="transfer record not found")
+    transf.status = TransferStatusEnum.REJECTED
+    db.commit()
+    db.refresh(transf)
+    return {"msg":"transfer rejected"}
+
+    
+@router.post("/{trans_id}/cancel")
+async def cancel_a_transfer_request(trans_id,curr_user: User = Depends(get_current_user),db: Session = Depends(get_db)) :
+    transf = db.query(AssetTransfers).filter(AssetTransfers.id == trans_id).first()
+    if not transf:
+        raise HTTPException(status_code=404, detail="transfer record not found")
+    transf.status = TransferStatusEnum.CANCELLED
+    db.commit()
+    db.refresh(transf)
+    return {"msg":"transfer cancelled"}  
+  
+@router.get("/pending")
+async def list_all_pending_transfers(curr_user: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    p = db.query(AssetTransfers).filter(AssetTransfers.status == TransferStatusEnum.PENDING).all()
+
+    return p
+
+@router.get("/by-user/{user_id}")
+async def show_all_user_transers(user_id,curr_user: User = Depends(get_current_user),db: Session = Depends(get_db)):
+
+    p = db.query(AssetTransfers).filter(or_( AssetTransfers.to_user_id == user_id,AssetTransfers.from_user_id == user_id)).all()
+
+
+    return p
+from fastapi import Depends, HTTPException, status, APIRouter, Query, Request, BackgroundTasks
+from ..models import User, TokenBase,PasswordResetToken
+from ..utilities import get_current_user, pwd_context, generate_id, authenticate_user, create_access_token, create_refresh_token,oauth2_scheme, check_token,revoke_tokens, SECRET_KEY,ALGORITHM, get_user_id,create_password_reset_token, validate_reset_token,revoke_tokens_byid
+from ..schemas.main import CreateUser,AuthMethod, UserOut, TokenOut,TokenOutId, LoginRequest,UserOutProfile, UserStatus, ChangePassword,PasswordResetResponse, PasswordResetRequest,PasswordReset
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from ..database import get_db
+from datetime import datetime, timedelta, timezone
+from ..system_vars import ACCESS_TOKEN_EXPIERY,default_new_user_status, send_emails,sys_logger
+from jose import jwt,JWTError
+from ..services.emailsender import AssetFlowEmailService
+import os
+from fastapi.security import OAuth2PasswordRequestForm
+from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv(dotenv_path="./fapi/.env")
+
+if send_emails:
+    email_service = AssetFlowEmailService(api_key=os.getenv("SENDINBLUE_API_KEY", "kk"))
+router = APIRouter(
+   
+    tags=['Authentication'],
+    prefix="/api/v1/auth"
+)
+
+@router.post("/register", status_code = status.HTTP_201_CREATED,response_model=UserOut)
+def user_register(user: CreateUser ,background_tasks: BackgroundTasks,   db: Session = Depends(get_db)):
+
+    existing_user = db.query(User).filter(User.email == user.email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="User already exists")
+ 
+    hashed_pass = pwd_context.hash(user.password)
+    user_id = generate_id()
+
+    new_user = User(
+        id=user_id,
+        profile_pic=user.profile_pic,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        email=user.email,
+        phone_number=user.phone_number,
+        department_id=user.department_id,
+        position_title=user.position_title,
+        is_accounting_officer=False,
+        password_hash=hashed_pass,  
+        role_id='no_priv',
+        status=default_new_user_status,
+        created_at=datetime.now(timezone.utc),
+        last_login=None,
+        gov_level=user.gov_level,
+        entity_type=user.entity_type,
+        entity_name=user.entity_name,
+        location=user.location.dict() if user.location else None,
+        access_scope='{}',
+        is_two_factor_enabled=False,
+        last_password_change=None,
+        login_attempts=None,
+        last_activity_at=None,
+        notes=user.notes,
+        auth_method=AuthMethod.password,
+    )
+    db.add(new_user)
+    try:
+        db.commit()
+        db.refresh(new_user) 
+    except IntegrityError as e:
+        db.rollback()
+        if "foreign key constraint" in str(e.orig).lower():
+            raise HTTPException(status_code=400, detail="Invalid department ID")
+        raise HTTPException(status_code=400, detail="Db integrity error")
+
+
+    if send_emails:
+        background_tasks.add_task(
+            email_service.send_account_created_email,
+            str(new_user.email),
+            str(new_user.first_name)
+        )
+    return new_user
+
+@router.post("/login", response_model=TokenOutId, status_code=status.HTTP_200_OK)
+def login(login_req: LoginRequest, db:Session = Depends(get_db)):
+    user = authenticate_user(login_req.email, login_req.password, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if user.status == "deleted":
+        raise HTTPException(status_code=401, detail="Account nolonger Exists, contact support")
+    if user.status == "inactive" and user.last_login == None:
+        raise HTTPException(status_code=401, detail="Account awaiting activation, contact support")
+    if user.status != "active":
+        raise HTTPException(status_code=401, detail="Account Deactivated, contact support")
+    
+    #bad imp - discuss use of speciffic atttribute role
+    if user.position_title == 'member':
+        rolem = user.position_title
+    elif user.role_id == 'role_super':
+        rolem = "superadmin"
+    elif user.role_id =='role_006':
+        rolem = "admin"
+    else:
+        rolem = "member"
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIERY)
+
+
+    access_token = create_access_token(
+        data={"sub": user.email, "id": user.id, "role": rolem,"username": user.first_name}, 
+        expires_delta=access_token_expires, db= db
+    )
+
+    if login_req.remember_me:
+        refresh_token_expiery = timedelta(days=7)
+    else:
+        refresh_token_expiery = access_token_expires
+    
+    refresh_token = create_refresh_token( data={"sub": user.email, "user_id": user.id}, expires_delta=refresh_token_expiery, db= db)
+
+
+
+
+
+
+    user.last_login = datetime.now(timezone.utc)  
+    db.commit()
+    return {"access_token": access_token,"refresh_token": refresh_token,"role": rolem ,"token_type": "bearer","a_expires" : ACCESS_TOKEN_EXPIERY * 60 }
+
+@router.post("/login/oauth2form", response_model=TokenOut)
+async def login_oauth2(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    remember_me: Optional[bool] = Query(default=False),
+    db: Session = Depends(get_db)
+):
+    user = authenticate_user(form_data.username, form_data.password, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if user.status != "active":
+        raise HTTPException(status_code=401, detail="Account Deactivated, contact support")
+ 
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIERY)
+    access_token = create_access_token(
+        data={"sub": user.email, "id": user.id},
+        expires_delta=access_token_expires,
+        db=db
+    )
+
+    refresh_token_expiery = timedelta(days=7) if remember_me else access_token_expires
+
+    refresh_token = create_refresh_token(
+        data={"sub": user.email, "id": user.id},
+        expires_delta=refresh_token_expiery,
+        db=db
+    )
+
+    user.last_login = datetime.now(timezone.utc)
+    db.commit()
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "a_expires": ACCESS_TOKEN_EXPIERY * 60
+    }
+
+
+@router.post("/logout")
+async def logout(
+    request: Request,
+    db: Session = Depends(get_db),
+    token: str = Depends(oauth2_scheme)
+):
+    if not check_token(token, db):
+        return "not logged in"
+    return revoke_tokens(request, db)
+
+@router.get("/protected")
+async def protected_route_test(
+    db: Session = Depends(get_db),
+    token: str = Depends(oauth2_scheme)
+):
+    if not check_token(token, db):
+        raise HTTPException(status_code=401, detail="Token invalid or revoked")
+    
+    return {"msg": "You are authorized"}
+
+
+@router.post("/refresh")
+async def refresh_token(
+    request: Request,
+    db: Session = Depends(get_db),
+    token: str = Depends(oauth2_scheme)
+):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        jti = payload.get("jti")
+        user_id = payload.get("id")
+        token_type = payload.get("type")
+        
+        if token_type != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        
+       
+        token_record = db.query(TokenBase).filter(
+            TokenBase.jti == jti,
+            TokenBase.revoked == False
+        ).first()
+        
+        if not token_record:
+            raise HTTPException(status_code=401, detail="Refresh token not found or revoked")
+        
+        if token_record.exp < datetime.now(timezone.utc): 
+            raise HTTPException(status_code=401, detail="Refresh token expired")
+    
+        db.query(TokenBase).filter(
+            TokenBase.user_id == user_id,
+            TokenBase.revoked == False
+        ).update({"revoked": True})
+        db.commit()     
+
+        original_expiry = token_record.exp
+        now = datetime.now(timezone.utc)
+        remaining = original_expiry - now
+        remaining_seconds = max(60, int(remaining.total_seconds()))
+        
+        new_access_token = create_access_token(
+            data={"sub": payload.get("sub"), "id": user_id},
+            expires_delta=timedelta(seconds=remaining_seconds),
+            db=db
+        )  
+
+        new_refresh_token = create_refresh_token(
+            data={"sub": payload.get("sub"), "id": user_id},
+            expires_delta=timedelta(seconds=remaining_seconds),
+            db=db
+        )
+        
+        return {
+            "access_token": new_access_token,
+            "refresh_token": new_refresh_token,
+            "token_type": "bearer",
+            "expires_in": remaining_seconds
+        }
+        
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    
+@router.post("/change-password", status_code=status.HTTP_200_OK)
+async def prifile_change_password(req : ChangePassword, curr_user :User = Depends(get_current_user), db: Session = Depends(get_db)):
+   
+    if req.old_password != req.old_password2:
+        raise  HTTPException(status_code=status.HTTP_304_NOT_MODIFIED, detail="Old Passwords dont match")
+   
+    user = authenticate_user(curr_user.email,req.old_password, db)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    if req.old_password == req.new_password:
+         raise HTTPException(status_code=401, detail="Old password and new password cannot be thesame")
+    
+    password_hash = pwd_context.hash(req.new_password)
+    user.password_hash = password_hash
+    db.commit()
+    db.refresh(user)
+
+    return {"msg": "password updated successfully"}
+
+@router.post("/request-password-reset", response_model=PasswordResetResponse)
+async def request_password_reset(reset_request: PasswordResetRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+
+    user = db.query(User).filter(User.email == reset_request.email).first()
+    
+    if not user:
+        return PasswordResetResponse(
+            message="If an account with this email exists, a password reset link has been sent.",
+            success=True
+        )
+    
+    if user.status == "deleted":
+        return PasswordResetResponse(
+            message="If an account with this email exists, a password reset link has been sent.",
+            success=True
+        )
+    
+    reset_token = create_password_reset_token(user.email, db)
+
+    background_tasks.add_task(
+        email_service.send_password_reset_email,
+        user.email,
+        str(user.first_name),
+        reset_token
+    )
+    
+    return PasswordResetResponse(
+        message="If an account with this email exists, a password reset link has been sent.",
+        success=True
+    )
+
+@router.get("/password-reset", response_model=dict)
+async def check_password_reset_token(token: str = Query(...), db: Session = Depends(get_db)):
+
+    user_email = validate_reset_token(token, db)
+    
+    if not user_email:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired reset token"
+        )
+    
+    user = db.query(User).filter(User.email == user_email).first()
+    
+    return {
+        "message": "Valid reset token",
+        "token": token,
+        "user_email": user_email,
+        "user_name": user.first_name if user else None,
+        "success": True
+    }
+
+@router.post("/password-reset", response_model=PasswordResetResponse)
+async def reset_password(reset_data: PasswordReset, db: Session = Depends(get_db)):
+
+    user_email = validate_reset_token(reset_data.token, db)
+    
+    if not user_email:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired reset token"
+        )
+    
+
+    user = db.query(User).filter(User.email == user_email).first()
+    
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+    
+    if len(reset_data.new_password) < 6:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 6 characters long"
+        )
+    
+
+    hashed_password = pwd_context.hash(reset_data.new_password)
+    
+    user.password_hash = hashed_password
+    
+    reset_token = db.query(PasswordResetToken).filter(
+        PasswordResetToken.token == reset_data.token
+    ).first()
+    
+    if reset_token:
+        reset_token.is_used = True
+    
+    revoke_tokens_byid(user.id, db)
+    
+    db.commit()
+    
+    return PasswordResetResponse(
+        message="Password reset successfully. Please login with your new password.",
+        success=True
+    )
+
+
+
+
+@router.get("/me", response_model=UserOutProfile, status_code=status.HTTP_200_OK)
+def get_my_profile(token: str = Depends(oauth2_scheme),db:Session = Depends(get_db)):
+
+    if not check_token(token, db):
+        raise HTTPException(status_code=401, detail="Token invalid or revoked")
+    
+    user_id = get_user_id(token,db)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="An Error Has occured")
+    
+    profile = db.query(User).filter(User.id == user_id).first()
+    
+    return profile from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from typing import List, Optional,Union,Any,Dict
+from ..database import get_db
+from ..models import Role, User, Departments
+from ..utilities import generate_id,get_current_user,get_changes
+from ..system_vars import sys_logger,debugging,default_new_department_status
+from ..services.logger_queue import enqueue_log
+from ..schemas.main import DepartmentDetails,DepartmentDetailsSimple, DepartmentStatus, CreateDepartment, UserStatus,NoChangesResponse,DepartmentUsers,DepartmentDetailsPublic,UserStatus
+from ..services.policy_eval import check_simple_permission,check_full_permission,get_user_perms
+from sqlalchemy import or_, func
+from datetime import datetime, timezone
+from sqlalchemy.orm import joinedload
+
+router = APIRouter(
+    prefix="/api/v1/departments", 
+    tags=["Departments "]
+    )
+
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED, response_model=DepartmentDetails)
+async def create_department(dep: CreateDepartment,curr: User = Depends(get_current_user),db:Session = Depends(get_db)):
+    
+    id = generate_id(40)
+    det = Departments(
+        dept_id = id,
+        name = dep.name,
+        arent_dept_id = dep.parent_dept_id ,
+        ntity_type = dep.entity_type ,
+        escription = dep.description ,
+        status = default_new_department_status 
+    )
+    db.add(det)
+    db.commit()
+    db.refresh(det)
+    return det
+
+@router.get("/",status_code=status.HTTP_200_OK,response_model=List[DepartmentDetails])
+async def list_all_departments(curr: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    
+    deps = db.query(Departments).all()
+    return deps
+
+@router.get("/simple",status_code=status.HTTP_200_OK,response_model=List[DepartmentDetailsSimple])
+async def list_all_departments_simple(curr: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    
+    deps = db.query(Departments).all()
+    return deps
+
+@router.get("/public",status_code=status.HTTP_200_OK,response_model=List[DepartmentDetailsPublic])
+async def list_all_departments_public(db: Session = Depends(get_db)):
+    """Lists all active departments"""
+    
+    deps = db.query(Departments).filter(Departments.status == UserStatus.active).all()
+    return deps
+
+@router.get("/{dep_id}/users",status_code=status.HTTP_200_OK,response_model=List[DepartmentUsers])
+async def get_department_members(dep_id,curr: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    users = db.query(User).filter(User.department_id == dep_id).all()
+    return users
+
+@router.get("/{dep_id}/assets",status_code=status.HTTP_200_OK,response_model=List[DepartmentUsers])
+async def get_department_assets_dummy(dep_id,curr: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    pass
+
+
+@router.get("/{dep_id}/hierarchy",status_code=status.HTTP_200_OK )
+async def get_department_hierachy(dep_id,curr: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    def build_hierarchy(dept) -> Dict[str, Any]:
+        return {
+            "dept_id": dept.dept_id,
+            "name": dept.name,
+            "entity_type": dept.entity_type.name if dept.entity_type else None,
+            "description": dept.description,
+            "status": dept.status.name if dept.status else None,
+            "sub_departments": [build_hierarchy(sub) for sub in dept.sub_departments]
+        }
+    
+    dept = db.query(Departments).filter(Departments.dept_id == dep_id).first()
+    if not dept:
+        raise HTTPException(status_code=404, detail="Department not found")
+    
+    return build_hierarchy(dept)
+
+@router.post("/{dep_id}/status",status_code=status.HTTP_200_OK,response_model=Union[dict ,NoChangesResponse])
+async def change_department_status(dep_id,stats: DepartmentStatus,curr: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    
+    dep = db.query(Departments).filter(Departments.dept_id == dep_id).first()
+
+    if dep.status == stats.status:
+        return {"details": "No change applied"}
+
+    dep.status = stats.status
+
+    db.commit()
+    db.refresh(dep)
+    return {"detail": f"changed status to: {dep.status.value}"}
+
+
+
+@router.get("/{dep_id}",status_code=status.HTTP_200_OK,response_model=DepartmentDetails)
+async def get_department_by_id(dep_id,curr: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    
+    
+    deps = db.query(Departments).filter(Departments.dept_id == dep_id).first()
+    if not deps:
+         raise HTTPException(status_code=404, detail="Department not found")
+    return deps
+
+
+@router.delete("/{dep_id}",status_code=status.HTTP_200_OK,response_model=dict)
+async def delete_a_department(dep_id,curr: User = Depends(get_current_user),db: Session = Depends(get_db)):
+
+    deps = db.query(Departments).filter(Departments.dept_id == dep_id).first()
+    if not deps:
+        raise HTTPException(status_code=404, detail="Department not found")
+    deps.status = UserStatus.deleted
+    db.commit()
+    db.refresh(deps)
+    return {"detail": "Successfully Deleted"}
+
+
+@router.put("/{dep_id}",status_code=status.HTTP_200_OK,response_model=Union[dict ,NoChangesResponse])
+async def patch_department_details(dep_id,det:CreateDepartment, curr: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    
+
+    deps = db.query(Departments).filter(Departments.dept_id == dep_id).first()
+    if not deps:
+         raise HTTPException(status_code=404, detail="Department not found")
+
+    upd ,changes= get_changes(deps,det)
+    
+    if changes:
+        
+        db.commit()
+        db.refresh(upd)
+        return {"changes": changes}
+    
+    return {"detail": "No changes supplied"}
+
+
+from fastapi import APIRouter, HTTPException, Depends, Query
+from typing import List, Optional
+from ..services.location_service import LocationService
+from ..schemas.location import *
+
+router = APIRouter(prefix="/api/v1/locations",
+                    tags=["locations"])
+ 
+
+def get_location_service() -> LocationService:
+    return LocationService()
+
+@router.get("/counties/", response_model=List[CountySimple])
+async def get_counties(service: LocationService = Depends(get_location_service)):
+    """Get list of all counties"""
+    return service.get_all_counties()
+
+@router.get("/counties/{county_identifier}/", response_model=dict)
+async def get_county_constituencies(
+    county_identifier: str,
+    service: LocationService = Depends(get_location_service)
+):
+    """Get constituencies for a specific county use ID or name"""
+    return service.get_constituencies(county_identifier)
+
+@router.get("/counties/{county_identifier}/constituencies/{constituency_name}/", response_model=WardResponse)
+async def get_constituency_wards(
+    county_identifier: str,
+    constituency_name: str,
+    service: LocationService = Depends(get_location_service)
+):
+    """Get wards for a specific constituency"""
+    return service.get_wards(county_identifier, constituency_name)
+
+@router.get("/counties/{county_identifier}/tree/", response_model=County)
+async def get_county_tree(
+    county_identifier: str,
+    service: LocationService = Depends(get_location_service)
+):
+    """Get complete county hierarchy (constituencies and wards)"""
+    return service.get_county_tree(county_identifier)
+
+@router.get("/search/", response_model=SearchResult)
+async def search_locations(
+    q: str = Query(..., min_length=2, description="Search query"),
+    service: LocationService = Depends(get_location_service)
+):
+    """Search across counties, constituencies, and wards"""
+    return service.search_locations(q)
+
+@router.get("/coordinates/reverse/", response_model=LocationDetails)
+async def reverse_geocode(
+    lat: float = Query(..., description="Latitude"),
+    lng: float = Query(..., description="Longitude"),
+    service: LocationService = Depends(get_location_service)
+):
+    """Get location details from coordinates"""
+    if not (-90 <= lat <= 90):
+        raise HTTPException(status_code=400, detail="Invalid latitude")
+    if not (-180 <= lng <= 180):
+        raise HTTPException(status_code=400, detail="Invalid longitude")
+    
+    return await service.reverse_geocode(lat, lng)
+
+@router.get("/search/geocode/", response_model=List[LocationDetails])
+async def forward_geocode(
+    address: str = Query(..., min_length=3, description="Address or place name"),
+    service: LocationService = Depends(get_location_service)
+):
+    """Get coordinates from address/place name"""
+    return await service.forward_geocode(address)from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+from typing import  Optional
+from decimal import Decimal
+from datetime import datetime, date
+
+from ..database import get_db
+from ..models import Assets,User,Departments
+from ..schemas.assets import AssetSummaryReport, DepartmentAssetReport
+from ..utilities import get_current_user
+from ..asset_utils import get_category_specific_reports_fields, format_attributes_for_display
+
+router = APIRouter(prefix="/api/v1/reports", tags=["Asset Reports"])
+
+@router.get("/assets-summary", response_model=AssetSummaryReport)
+async def get_assets_summary_report(
+    department_id: Optional[str] = None,
+    category: Optional[str] = None,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """a comprehensive assets summary report"""
+
+    query = db.query(Assets).filter(Assets.is_deleted == False)
+    
+    if department_id:
+        query = query.filter(Assets.department_id == department_id)
+    if category:
+        query = query.filter(Assets.category == category)
+    if date_from:
+        query = query.filter(Assets.acquisition_date >= date_from)
+    if date_to:
+        query = query.filter(Assets.acquisition_date <= date_to)
+    
+    assets = query.all()
+
+    total_assets = len(assets)
+    total_value = sum(asset.current_value or asset.acquisition_cost or Decimal(0) for asset in assets)
+    
+    by_category = {}
+    for asset in assets:
+        category_name = asset.category
+        if category_name not in by_category:
+            by_category[category_name] = {
+                "count": 0,
+                "total_value": Decimal(0),
+                "avg_value": Decimal(0),
+                "operational_count": 0,
+                "impaired_count": 0
+            }
+        
+        by_category[category_name]["count"] += 1
+        asset_value = asset.current_value or asset.acquisition_cost or Decimal(0)
+        by_category[category_name]["total_value"] += asset_value
+        
+        if asset.status == "Operational":
+            by_category[category_name]["operational_count"] += 1
+        elif asset.status in ["Impaired", "Under Maintenance"]:
+            by_category[category_name]["impaired_count"] += 1
+
+    for category_data in by_category.values():#calc avg
+        if category_data["count"] > 0:
+            category_data["avg_value"] = category_data["total_value"] / category_data["count"]
+
+    by_status = {}
+    for asset in assets:
+        status = asset.status
+        if status not in by_status:
+            by_status[status] = {"count": 0, "total_value": Decimal(0)}
+        
+        by_status[status]["count"] += 1
+        asset_value = asset.current_value or asset.acquisition_cost or Decimal(0)
+        by_status[status]["total_value"] += asset_value
+
+    by_condition = {}
+    for asset in assets:
+        condition = asset.condition or "unknown"
+        if condition not in by_condition:
+            by_condition[condition] = {"count": 0, "total_value": Decimal(0)}
+        
+        by_condition[condition]["count"] += 1
+        asset_value = asset.current_value or asset.acquisition_cost or Decimal(0)
+        by_condition[condition]["total_value"] += asset_value
+    
+    return AssetSummaryReport(
+        total_assets=total_assets,
+        total_value=total_value,
+        by_category=by_category,
+        by_status=by_status,
+        by_condition=by_condition
+    )
+
+@router.get("/department-assets/{dept_id}", response_model=DepartmentAssetReport)
+async def get_department_asset_report(dept_id: str,
+    include_top_assets: bool = Query(True),
+    top_assets_limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db),current_user: User = Depends(get_current_user)
+):
+    """Get detailed asset report for a specific department"""
+
+    department = db.query(Departments).filter(Departments.dept_id == dept_id).first()
+    if not department:
+        raise HTTPException(status_code=404, detail="Department not found")
+    
+    assets = db.query(Assets).filter( Assets.department_id == dept_id, Assets.is_deleted == False).all()
+    
+    total_assets = len(assets)
+    total_value = sum(asset.current_value or asset.acquisition_cost or Decimal(0) for asset in assets)
+    
+    assets_by_category = {}
+    for asset in assets:
+        category = asset.category
+        assets_by_category[category] = assets_by_category.get(category, 0) + 1
+    
+    assets_by_status = {}
+    for asset in assets:
+        status = asset.status
+        assets_by_status[status] = assets_by_status.get(status, 0) + 1
+
+    top_assets = []
+    if include_top_assets:
+        top_assets_query = sorted(
+            assets,
+            key=lambda x: x.current_value or x.acquisition_cost or Decimal(0),
+            reverse=True
+        )[:top_assets_limit]
+        top_assets = top_assets_query
+    
+    return DepartmentAssetReport(
+        department_id=dept_id,
+        department_name=department.name,
+        total_assets=total_assets,
+        total_value=total_value,
+        assets_by_category=assets_by_category,
+        assets_by_status=assets_by_status,
+        top_assets=top_assets
+    )
+
+@router.get("/assets-by-condition")
+async def get_assets_by_condition_report(
+    department_id: Optional[str] = None,
+    category: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = db.query(Assets).filter(Assets.is_deleted == False)
+    
+    if department_id:
+        query = query.filter(Assets.department_id == department_id)
+    if category:
+        query = query.filter(Assets.category == category)
+    
+    assets = query.all()
+    
+    assets_by_condition = {
+        "new": [],
+        "excellent": [],
+        "good": [],
+        "fair": [],
+        "poor": [],
+        "unknown": []
+    }
+    
+    condition_stats = {
+        "new": {"count": 0, "total_value": Decimal(0)},
+        "excellent": {"count": 0, "total_value": Decimal(0)},
+        "good": {"count": 0, "total_value": Decimal(0)},
+        "fair": {"count": 0, "total_value": Decimal(0)},
+        "poor": {"count": 0, "total_value": Decimal(0)},
+        "unknown": {"count": 0, "total_value": Decimal(0)}
+    }
+    
+    for asset in assets:
+        condition = asset.condition or "unknown"
+        
+        asset_info = {
+            "id": asset.id,
+            "description": asset.description,
+            "tag_number": asset.tag_number,
+            "category": asset.category,
+            "current_value": asset.current_value or asset.acquisition_cost,
+            "acquisition_date": asset.acquisition_date,
+            "location": asset.location
+        }
+        
+        assets_by_condition[condition].append(asset_info)
+        condition_stats[condition]["count"] += 1
+        condition_stats[condition]["total_value"] += asset.current_value or asset.acquisition_cost or Decimal(0)
+    
+    return {
+        "summary": condition_stats,
+        "assets_by_condition": assets_by_condition,
+        "generated_at": datetime.now(),
+        "filters_applied": {
+            "department_id": department_id,
+            "category": category
+        }
+    }
+
+@router.get("/depreciation-report")
+async def get_depreciation_report(
+    department_id: Optional[str] = None,
+    category: Optional[str] = None,
+    min_depreciation_rate: Optional[float] = None,
+    db: Session = Depends(get_db),current_user: User = Depends(get_current_user)
+):
+    """Get depreciation report showing assets with depreciation details"""
+    
+    query = db.query(Assets).filter(Assets.is_deleted == False, Assets.depreciation_rate.isnot(None), Assets.acquisition_date.isnot(None))
+    
+    if department_id:
+        query = query.filter(Assets.department_id == department_id)
+    if category:
+        query = query.filter(Assets.category == category)
+    if min_depreciation_rate:
+        query = query.filter(Assets.depreciation_rate >= min_depreciation_rate)
+    
+    assets = query.all()
+    
+    depreciation_report = []
+    total_original_value = Decimal(0)
+    total_current_value = Decimal(0)
+    total_depreciated_amount = Decimal(0)
+    
+    for asset in assets:
+        if asset.acquisition_cost and asset.depreciation_rate and asset.acquisition_date:
+            original_value = asset.acquisition_cost
+            current_value = asset.current_value or original_value
+            depreciated_amount = original_value - current_value
+            depreciation_percentage = (depreciated_amount / original_value * 100) if original_value > 0 else 0
+            
+            # Calculate years since acquisition
+            years_owned = (datetime.now().date() - asset.acquisition_date).days / 365.25
+            
+            asset_report = {
+                "asset_id": asset.id,
+                "description": asset.description,
+                "tag_number": asset.tag_number,
+                "category": asset.category,
+                "acquisition_date": asset.acquisition_date,
+                "years_owned": round(years_owned, 2),
+                "original_value": original_value,
+                "current_value": current_value,
+                "depreciation_rate": asset.depreciation_rate,
+                "depreciated_amount": depreciated_amount,
+                "depreciation_percentage": round(depreciation_percentage, 2),
+                "useful_life_years": asset.useful_life_years,
+                "remaining_life_years": max(0, (asset.useful_life_years or 0) - years_owned) if asset.useful_life_years else None
+            }
+            
+            depreciation_report.append(asset_report)
+            total_original_value += original_value
+            total_current_value += current_value
+            total_depreciated_amount += depreciated_amount
+
+    depreciation_report.sort(key=lambda x: x["depreciation_percentage"], reverse=True)
+    
+    summary = {
+        "total_assets": len(depreciation_report),
+        "total_original_value": total_original_value,
+        "total_current_value": total_current_value,
+        "total_depreciated_amount": total_depreciated_amount,
+        "overall_depreciation_percentage": round(
+            (total_depreciated_amount / total_original_value * 100) if total_original_value > 0 else 0, 2
+        )
+    }
+    
+    return {
+        "summary": summary,
+        "assets": depreciation_report,
+        "generated_at": datetime.now(),
+        "filters_applied": {
+            "department_id": department_id,
+            "category": category,
+            "min_depreciation_rate": min_depreciation_rate
+        }
+    }
+
+@router.get("/category-specific-report/{category}")
+async def get_category_specific_report(
+    category: str,
+    department_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = db.query(Assets).filter( Assets.category == category, Assets.is_deleted == False)
+    
+    if department_id:
+        query = query.filter(Assets.department_id == department_id)
+    
+    assets = query.all()
+    
+    if not assets:
+        return {
+            "category": category,
+            "assets": [],
+            "total_count": 0,
+            "message": "No assets found for this category"
+        }
+    
+    category_fields = get_category_specific_reports_fields(category)
+    
+    formatted_assets = []
+    for asset in assets:
+        asset_data = {
+            "id": asset.id,
+            "description": asset.description,
+            "tag_number": asset.tag_number,
+            "status": asset.status,
+            "condition": asset.condition,
+            "location": asset.location,
+            "acquisition_date": asset.acquisition_date,
+            "current_value": asset.current_value or asset.acquisition_cost,
+        }
+        
+        if asset.specific_attributes:
+            formatted_specific = format_attributes_for_display(category, asset.specific_attributes)
+            asset_data["specific_attributes"] = formatted_specific
+
+            for field_info in category_fields:#add key filds
+                field_name = field_info["field"]
+                if field_name in asset.specific_attributes:
+                    asset_data[field_info["label"]] = asset.specific_attributes[field_name]
+        
+        formatted_assets.append(asset_data)
+    
+    total_value = sum(asset.current_value or asset.acquisition_cost or Decimal(0) for asset in assets)
+    avg_value = total_value / len(assets) if assets else Decimal(0)
+    
+    status_distribution = {}
+    for asset in assets:
+        status = asset.status
+        status_distribution[status] = status_distribution.get(status, 0) + 1
+    
+    return {
+        "category": category,
+        "total_count": len(assets),
+        "total_value": total_value,
+        "average_value": avg_value,
+        "status_distribution": status_distribution,
+        "category_specific_fields": category_fields,
+        "assets": formatted_assets,
+        "generated_at": datetime.now(),
+        "filters_applied": {
+            "department_id": department_id
+        }
+    }from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from typing import List
+from ..database import get_db
+from ..models import Role, User
+from ..schemas.main import RoleCreate, RoleOut,UsersWithRoleX,RoleUpdate
+from ..utilities import generate_id,get_current_user,generate_id
+from ..system_vars import sys_logger,debugging
+from ..services.logger_queue import enqueue_log
+from ..schemas.main import  ActionType, LogLevel
+from ..services.policy_eval import check_simple_permission,require_specific_role,check_full_permission
+
+
+router = APIRouter(
+    prefix="/api/v1/roles", 
+    tags=["Roles"]
+    )
+
+@router.post("/no-auth-crit", response_model=RoleOut, status_code=status.HTTP_201_CREATED)
+async def create_role_noperm(rdata: RoleCreate,db:Session = Depends(get_db)):
+    id = generate_id(30)
+    role = Role(id =id,name=rdata.name, description =rdata.description ,permissions=rdata.permissions)
+    db.add(role)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Role with name '{rdata.name}' already exists")
+
+    db.refresh(role)
+
+    if sys_logger:
+        await enqueue_log(
+            user_id=None,
+            action=ActionType.CREATE,
+            target_table="roles",
+            target_id=id,
+            details={"route": "no-auth-crit", "payload": rdata.dict(exclude_unset=True)},
+            level=LogLevel.INFO
+        )
+    return role
+
+
+@router.post("/", response_model=RoleOut, status_code=status.HTTP_201_CREATED)
+async def create_role(rdata: RoleCreate,current_user: User = Depends(get_current_user) ,db:Session = Depends(get_db)):
+    state,det = require_specific_role(current_user,['super_user_do'])
+    if not state:
+        if sys_logger:
+            await enqueue_log(
+               user_id=current_user.id,
+               action=ActionType.SUSPICIOUS_ACTIVITY,
+               target_table="roles",
+               target_id=None,
+               details=f"Insufficient permissions to create role {rdata.dict(exclude_unset=True)}",
+               level=LogLevel.CRITICAL)
+        
+        raise HTTPException(status_code=403, detail=det)
+    idd = generate_id(30)
+    role = Role(id = idd ,name=rdata.name,description =rdata.description, permissions=rdata.permissions)
+
+        
+    db.add(role)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Role with name '{rdata.name}' already exists")
+
+    db.refresh(role)
+
+    if sys_logger:
+        await enqueue_log(
+           user_id=current_user.id,
+           action=ActionType.CREATE,
+           target_table="roles",
+           target_id=idd,
+           details=None,
+           level=LogLevel.INFO)
+    return role
+
+@router.get("/", response_model=List[RoleOut])
+async def list_roles(current_user: User = Depends(get_current_user),db: Session = Depends(get_db)):
+    
+    
+    if not check_simple_permission(current_user, "role", "read"):
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="roles",
+                target_id=None,
+                details="Attempt to list roles without permission",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.VIEW,
+            target_table="roles",
+            target_id=None,
+            details=None,
+            level=LogLevel.INFO
+    )
+    roles = db.query(Role).all()
+    if debugging:
+        print("\n\n\n\n\n\nreturnung role\n\n\n")
+    return roles
+
+
+@router.get("/{role_id}", response_model=RoleOut)
+async def get_role(role_id: str,current_user: User = Depends(get_current_user) ,db:Session = Depends(get_db)):
+    if not check_simple_permission(current_user, "role", "read"):
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="roles",
+                target_id=role_id,
+                details="Attempt to get role without permission",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.VIEW,
+            target_table="roles",
+            target_id=role_id,
+            details=None,
+            level=LogLevel.INFO
+            ) 
+    role = db.query(Role).filter(Role.id == role_id).first()
+    if not role:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.VIEW,
+                target_table="roles",
+                target_id=role_id,
+                details="Role not found",
+                level=LogLevel.INFO
+            )
+        raise HTTPException(status_code=404, detail="Role not found")
+    return role
+
+@router.get("/{role_id}/permissions")
+async def get_role_permissions(role_id: str,current_user: User = Depends(get_current_user) ,db:Session = Depends(get_db)):
+    if not check_simple_permission(current_user, "role", "read"):
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="roles",
+                target_id=role_id,
+                details="Attempt to read role permissions without permission",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+
+    role = db.query(Role).filter(Role.id == role_id).first()
+    if not role:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.VIEW,
+                target_table="roles",
+                target_id=role_id,
+                details="Role not found when fetching permissions",
+                level=LogLevel.INFO
+            )
+        raise HTTPException(status_code=404, detail="Role not found")
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.VIEW,
+            target_table="roles",
+            target_id=role_id,
+            details="Fetched role permissions",
+            level=LogLevel.INFO
+        )
+    
+    return role.permissions or {}
+
+
+@router.post("/{role_id}/permissions/add")
+async def add_permission(role_id: str,permission: str,db: Session = Depends(get_db),current_user: User = Depends(get_current_user)):
+    role = db.query(Role).filter(Role.id == role_id).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+
+    perms = set(role.permissions or [])
+    if permission in perms:
+        raise HTTPException(status_code=400, detail=f"Permission '{permission}' already exists in role")
+
+    perms.add(permission)
+    role.permissions = list(perms)
+    db.commit()
+    db.refresh(role)
+
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.UPDATE,
+            target_table="roles",
+            target_id=role_id,
+            details={"added_permission": permission},
+            level=LogLevel.INFO,
+        )
+
+    return {"detail": f"Permission '{permission}' added", "permissions": role.permissions}
+
+
+@router.post("/{role_id}/permissions/remove")
+async def remove_permission(role_id: str,permission: str,db: Session = Depends(get_db),current_user: User = Depends(get_current_user)):
+    role = db.query(Role).filter(Role.id == role_id).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+
+    perms = set(role.permissions or [])
+    if permission not in perms:
+        raise HTTPException(status_code=400, detail=f"Permission '{permission}' not found in role")
+
+    perms.remove(permission)
+    role.permissions = list(perms)
+    db.commit()
+    db.refresh(role)
+
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.UPDATE,
+            target_table="roles",
+            target_id=role_id,
+            details={"removed_permission": permission},
+            level=LogLevel.INFO,
+        )
+
+    return {"detail": f"Permission '{permission}' removed", "permissions": role.permissions}
+
+@router.put("/{role_id}", response_model=RoleOut)
+async def update_role(role_id: str, rdata: RoleUpdate,current_user: User = Depends(get_current_user) ,db:Session = Depends(get_db)):
+    # if not check_simple_permission(current_user, "role", "update"):
+    #     raise HTTPException(status_code=403, detail="Not enough permissions")
+    try:
+        check_full_permission(current_user, "role", "update", db, resource=None)
+    except HTTPException as e:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="roles",
+                target_id=role_id,
+                details=f"Update denied: {e.detail}",
+                level=LogLevel.CRITICAL
+            )
+        raise
+
+    role = db.query(Role).filter(Role.id == role_id).first()
+    if not role:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.UPDATE,
+                target_table="roles",
+                target_id=role_id,
+                details="Role not found for update",
+                level=LogLevel.INFO
+            )
+        raise HTTPException(status_code=404, detail="Role not found")
+    
+    changes = {}
+    update_data = rdata.dict(exclude_unset=True)
+    for field, value in update_data.items():
+        old_value = getattr(role, field)
+        if old_value != value:
+            setattr(role, field, value)
+            changes[field] = {"old": old_value, "new": value}
+  
+    role.name = rdata.name
+    role.permissions = rdata.permissions
+    db.commit()
+    db.refresh(role)
+
+
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.UPDATE,
+            target_table="roles",
+            target_id=role_id,
+            details=changes or rdata.dict(exclude_unset=True),
+            level=LogLevel.INFO
+        )
+
+    return role
+
+@router.delete("/{role_id}", status_code=status.HTTP_202_ACCEPTED)
+async def delete_role(role_id: str,current_user: User = Depends(get_current_user) ,db:Session = Depends(get_db)):
+    # if not check_simple_permission(current_user, "role", "delete"):
+    #     raise HTTPException(status_code=403, detail="Not enough permissions")
+    try:
+        check_full_permission(current_user, "role", "delete", db, resource=None)
+    except HTTPException as e:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="roles",
+                target_id=role_id,
+                details=f"Delete denied: {e.detail}",
+                level=LogLevel.CRITICAL
+            )
+        raise
+
+    role = db.query(Role).filter(Role.id == role_id).first()
+    if not role:
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.DELETE,
+                target_table="roles",
+                target_id=role_id,
+                details="Role not found for delete",
+                level=LogLevel.INFO
+            )
+        raise HTTPException(status_code=404, detail="Role not found")
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.DELETE,
+            target_table="roles",
+            target_id=role_id,
+            details=None,
+            level=LogLevel.INFO
+        )
+    db.delete(role)
+    db.commit()
+
+    return {"detail": f"deleted role: {role.id}"}
+
+@router.get("/user/{role_id}",status_code=status.HTTP_200_OK, response_model=List[UsersWithRoleX])
+async def get_all_users_with_role(role_id: str,current_user: User = Depends(get_current_user) ,db:Session = Depends(get_db)):
+    if not check_simple_permission(current_user, "role", "read"):
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="roles",
+                target_id=role_id,
+                details="Attempt to list users with role without role.read",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions (role.read)")
+
+    if not check_simple_permission(current_user, "users", "read"):
+        if sys_logger:
+            await enqueue_log(
+                user_id=current_user.id,
+                action=ActionType.SUSPICIOUS_ACTIVITY,
+                target_table="users",
+                target_id=None,
+                details="Attempt to list users with role without users.read",
+                level=LogLevel.WARNING
+            )
+        raise HTTPException(status_code=403, detail="Not enough permissions (users.read)")
+
+    users = db.query(User).filter(User.role_id == role_id).all()
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.VIEW,
+            target_table="roles",
+            target_id=role_id,
+            details={"view": f"all users with role {role_id}", "count": len(users)},
+            level=LogLevel.INFO
+        )
+    return usersfrom fastapi import APIRouter, Depends, HTTPException, status,BackgroundTasks
+from sqlalchemy.orm import Session
+from typing import List, Optional,Union
+from ..database import get_db
+from ..models import Role, User,GovLevel
+from ..schemas.main import CreateUserAdmin,AuthMethod
+from ..utilities import generate_id,get_current_user,generate_id,pwd_context,get_changes
+from ..system_vars import sys_logger,debugging,user_default_pass,default_new_user_status,send_emails,sys_logger
+from ..services.logger_queue import enqueue_log
+from ..schemas.main import  ActionType, LogLevel,GivePerms,UserStatus,UserOutWithRole, ModifyProfile,ChangeUserStatus,NoChangesResponse,UserOutProfile
+from ..services.policy_eval import check_simple_permission,check_full_permission,get_user_perms
+from sqlalchemy import or_, func
+from datetime import datetime, timezone
+from sqlalchemy.orm import joinedload
+
+if send_emails:
+    from .auth import email_service
+router = APIRouter(
+    prefix="/api/v1/users", 
+    tags=["Users "]
+    )
+
+@router.get("/",status_code=status.HTTP_200_OK,response_model=List[UserOutWithRole])
+async def get_all_users_param(current_user: User = Depends(get_current_user),db :Session = Depends(get_db),
+                              status: Optional[UserStatus] = None,
+                              namecontains: Optional[str] = None,
+                              email:Optional[str] = None,
+                              last_login:Optional[datetime] = None,
+                              phone:Optional [str] = None,
+
+                              location_code: Optional[str] =None,
+                              department_id:Optional[str] =None,
+                              gov_level: Optional[GovLevel] = None,
+                              role_id: Optional[str] = None):
+    """use is as a search function
+
+    Args:
+
+      - status (Optional[UserStatus], optional): active,inactive ... Defaults to None.
+      - namecontains (Optional[str], optional): part of name. Defaults to None.
+      - isactive (Optional[bool], optional): true, false,bool. Defaults to None.
+      - email (Optional[str], optional): full email. Defaults to None.
+      - last_login (Optional[datetime], optional): timestamp . Defaults to None.
+      - phone (Optional[str], optional): 07xbhjb. Defaults to None.
+      - role (Optional[str], optional): role name, not id. Defaults to None.
+
+    Raises:
+        HTTPException: not fround
+
+    Returns:
+        User: _description_
+    """
+
+    if not check_simple_permission(current_user, "users","read"):
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+
+    # returns only users within checker scope
+    # - check department or reginal access scope
+    # - attribute/roles - department head/ hr/ analytics ==[to imp]
+    users = db.query(User)
+    # users = db.query(User).options(
+    #     joinedload(User.role),
+    #     joinedload(User.department)
+    # )
+
+    # if current_user.access_scope:
+    #     scope = current_user.access_scope
+
+    #     geographic_scope = scope.get("geographic", [])
+    #     if geographic_scope and "all_counties" not in geographic_scope:
+    #         query = query.filter(User.location_code.in_(geographic_scope))
+        
+    #     department_scope = scope.get("departments", [])
+    #     if department_scope and "all" not in department_scope:
+    #         query = query.join(User.department).filter(
+    #             Departments.name.in_(department_scope)
+    #         )
+
+
+    if status:
+        users= users.filter(User.status == status)
+    if namecontains:
+        term = namecontains.lower().strip()
+        pattern = '%' + '%'.join(term) + '%'
+        users = users.filter(
+            or_(
+                func.lower(User.first_name).like(pattern),
+                func.lower(User.last_name).like(pattern),
+                func.lower(func.concat(User.first_name, ' ', User.last_name)).like(pattern)
+            )
+        )
+   
+    if email:
+        users = users.filter(User.email == email)
+    if last_login:
+        users = users.filter(User.last_login >= last_login)
+    if phone:
+        users = users.filter(User.phone == phone)
+    if role_id:
+        users = users.join(User.role).filter(Role.name == role_id)
+    if gov_level:
+        users = users.filter(User.gov_level == gov_level)
+    
+    if sys_logger:
+        await enqueue_log(
+            user_id=current_user.id,
+            action=ActionType.VIEW,
+            target_table="users",
+            target_id=None,
+            details={"msg": "search function"},
+            level=LogLevel.INFO
+            )  
+    
+    return users.all()
+
+@router.get("/me",status_code=status.HTTP_200_OK,response_model=UserOutProfile)
+async def get_my_profile(me :User = Depends(get_current_user),db: Session = Depends(get_db)):
+    return me
+
+@router.put("/me",status_code=status.HTTP_200_OK,response_model=Union[UserOutProfile ,NoChangesResponse])
+async def patch_my_profile(newval: ModifyProfile, me :User = Depends(get_current_user),db: Session = Depends(get_db)):
+    old = db.query(User).filter(User.id == me.id).first()
+    newme ,changes= get_changes(old,newval)
+    
+    if changes:
+        
+        db.commit()
+        db.refresh(newme)
+        return newme
+    
+    return {"detail": "No changes supplied"}
+
+
+@router.get("/me/permissions",status_code=status.HTTP_200_OK)
+async def get_my_allowd_permissions(me :User = Depends(get_current_user),db: Session = Depends(get_db)):
+    #acess scope check
+
+    return get_user_perms(user=me,db=db)
+
+@router.get("/me/permissions/{resource}",status_code=status.HTTP_200_OK)
+async def get_my_allowed_actions_for_resource(resource ,me :User = Depends(get_current_user),db: Session = Depends(get_db)):
+    #acess scope
+    #permissions for assigned role= make helper func
+    perms = get_user_perms(user=me,db=db)
+    specific = [p for p in perms if p.startswith(f"{resource}.")]
+    actions =sorted({p.split(".",1)[1] for p in specific})
+
+    return actions
+
+#----------------------------------
+@router.get("/{user_id}/permissions",status_code=status.HTTP_200_OK)
+async def get_user_permissions_adm(user_id,curr : User = Depends(get_current_user),db: Session = Depends(get_db)):
+    #add checks, hr, permissision to check, scope, shouldnt check superior
+    perms = get_user_perms(id=user_id,db=db)
+    return perms
+
+@router.get("/{user_id}/permissions/{resource}",status_code=status.HTTP_200_OK)
+async def get_user_permissions_per_resource_adm(resource,user_id,curr : User = Depends(get_current_user),db: Session = Depends(get_db)):
+
+    perms = get_user_perms(id=user_id,db=db)
+    specific = [p for p in perms if p.startswith(f"{resource}.")]
+    actions =sorted({p.split(".",1)[1] for p in specific})
+    return actions
+
+@router.put("/{user_id}/permissions",status_code=status.HTTP_200_OK)
+async def give_user_permissions_adm(user_id ,pp: GivePerms,curr : User = Depends(get_current_user),db: Session = Depends(get_db)):
+    #check fist if you have said permission, then give
+    user = db.query(User).filter(User.id == user_id).first()
+
+    role_perms = db.query(Role).filter(Role.id == user.role_id).first()
+        
+    if not role_perms:
+        raise HTTPException(status_code=404, detail="Target not Assigned any role")
+
+    rperm = set(role_perms.permissions or [])
+    aperm = set(user.assigned_perms or [])
+
+    nperm = []
+
+    for p in pp.permissions:
+        if p not in rperm and p not in aperm:
+            nperm.append(p)
+            aperm.add(p)
+
+    user.assigned_perms = list(aperm)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return {"added": nperm,"now_has": user.assigned_perms}
+
+@router.get("/{user_id}/permissions/{resource}",status_code=status.HTTP_200_OK)
+async def get_user_permissions_by_resource_adm(user_id,resource,curr : User = Depends(get_current_user),db: Session = Depends(get_db)):
+    #add checks, hr, permissision to check, scope, shouldnt check superior
+    perms = get_user_perms(id=user_id,db=db)
+    specific = [p for p in perms if p.startswith(f"{resource}.")]
+    actions =sorted({p.split(".",1)[1] for p in specific})
+
+    return actions
+
+
+@router.get("/{user_id}", response_model=UserOutWithRole)
+async def get_user_details(
+    user_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get specific user details with resource-based access control"""
+    # - confirm checker department below target
+    #- checker attributes manage-attributes, HR
+    # - else return not enoth perm to view this user
+    
+    target = db.query(User).options(
+        joinedload(User.role),
+        joinedload(User.department)
+    ).filter(User.id == user_id).first()
+    
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # resource = {
+    #     "target_id": target.id,
+    #     "target_county": target.location_code,
+    #     "target_department": target.department.name if target.department else None,
+    #     "target_role": target.role.name if target.role else None,
+    #     "is_self": current_user.id == user_id,
+    #     "is_same_county": current_user.location_code == target.location_code,
+    #     "is_same_department": current_user.department_id == target.department_id
+    # }
+
+    # if not check_permission(current_user, "users", "read", db, resource):
+    #     raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+    return target
+
+@router.post("/", status_code=status.HTTP_201_CREATED,response_model=UserOutWithRole)
+
+async def create_new_user_adm(user: CreateUserAdmin , current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # must be hr , has create-user attribute
+    existing_user = db.query(User).filter(User.email == user.email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="User already exists")
+ 
+    hashed_pass = pwd_context.hash(user_default_pass)
+    user_id = generate_id()
+
+    new_user = User(
+        id=user_id,
+        profile_pic=user.profile_pic,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        email=user.email,
+        phone_number=user.phone_number,
+        department_id=user.department_id,
+        position_title=user.position_title,
+        is_accounting_officer=False,
+        password_hash=hashed_pass,  
+        role_id=user.role_id,
+        status=user.status,
+        created_at=datetime.now(timezone.utc),
+        last_login=None,
+        gov_level=user.gov_level,
+        entity_type=user.entity_type,
+        entity_name=user.entity_name,
+        location=user.location.dict(),
+        access_scope='{}',
+        is_two_factor_enabled=False,
+        last_password_change=None,
+        login_attempts=None,
+        last_activity_at=None,
+        notes=user.notes,
+        auth_method=AuthMethod.password,
+    )
+
+    db.add(new_user)
+    db.commit()
+    
+    db.refresh(new_user) 
+    return new_user
+
+
+
+@router.put("/{user_id}",status_code=status.HTTP_200_OK,response_model=Union[dict ,NoChangesResponse]) #UserOutWithRole
+# hr, change doesnt escalate rank,
+async def patch_user_details_adm(user_id,usernd:CreateUserAdmin ,current_user: User = Depends(get_current_user) ,db: Session = Depends(get_db)):
+
+    usr = db.query(User).filter(User.id == user_id).first()
+
+    new_usr, changes = get_changes(usr,usernd)
+    if changes:
+        
+        db.commit()
+        db.refresh(new_usr)
+        return changes
+    
+
+    # raise HTTPException(detail="No changes applied", status_code=200)
+    return {"detail": "No changes supplied"}
+
+
+
+@router.put("/{user_id}/status", status_code=status.HTTP_200_OK,response_model=Union[dict,UserOutWithRole])
+async def patch_user_status(user_id,usernd:ChangeUserStatus ,background_tasks: BackgroundTasks,current_user: User = Depends(get_current_user) ,db: Session = Depends(get_db)):
+    #dep head, target subordinate, can update status, in scope,dep,coumty or national, ht
+
+    usr = db.query(User).filter(User.id == user_id).first()
+    if not usr:
+        raise HTTPException(detail="User not found",status_code=status.HTTP_400_BAD_REQUEST)
+    if usr.status == usernd.status :
+        return {"detail": "No changes supplied"}
+
+    usr.status = usernd.status
+    
+    db.commit()
+    db.refresh(usr)
+    if send_emails:
+        background_tasks.add_task(
+            email_service.send_account_activated_email,
+            str(usr.email),
+            str(usr.first_name)
+        )
+    return {"detail": f"status changed to: {usr.status.value}"}
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_200_OK,response_model=dict)
+async def delete_user(user_id,usernd:ChangeUserStatus ,current_user: User = Depends(get_current_user) ,db: Session = Depends(get_db)):
+    #dep head, target subordinate, can update status, in scope,dep,coumty or national, ht
+
+    usr = db.query(User).filter(User.id == user_id).first()
+    if usr.status.value == "deleted":
+        return {"detail": "User Already Deleted"}
+    usr.status = UserStatus.deleted
+    db.commit()
+    db.refresh(usr)
+
+    return {"detail":f"Success! delete user{usr.id}"}
+

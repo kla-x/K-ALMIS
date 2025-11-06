@@ -1,0 +1,44 @@
+USER
+  mfa
+  ip save
+  login attempts timeout
+  login hist [time, ip, uagent]
+  new unrecognized login report/email
+  force pass change, x months
+  last activity
+  
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Variables-holder
+  password reset duration
+  
+  

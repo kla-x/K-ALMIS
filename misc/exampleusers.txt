@@ -1,0 +1,11 @@
+#Example User Data showing gov_level and entity_type usage
+
+j.kamau@treasury.go.ke
+m.wanjiku@cog.go.ke
+d.kiprotich@kenha.co.ke
+g.akinyi@kisumu.go.ke"
+p.muthoni@nakuru.assembly.go.ke
+s.chebet@mombasa.go.ke
+j.ochieng@tsc.go.ke"
+a.nyokabi@kplc.co.ke
+    all_pass = 'string'

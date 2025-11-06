@@ -1,0 +1,283 @@
+ class TokenBase(Base):
+    __tablename__ = 'usertokens'
+
+    jti = Column(String(40), primary_key=True, index=True)
+    iat = Column(TIMESTAMP, nullable=False)
+    user_id = Column(String(60), ForeignKey('users.id'))
+    exp = Column(TIMESTAMP, nullable=False)
+    token = Column(String(500), nullable=False)
+    revoked = Column(BOOLEAN)
+
+
+    user = relationship("Users", back_populates="tokens")
+
+class Role(Base):
+    __tablename__ = "roles"
+    
+    id = Column(String(50), primary_key=True, index=True)
+    name = Column(String(50), unique=True, nullable=False)
+    permissions = Column(JSON)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    users = relationship("User", back_populates="role")
+
+
+class UserStatus(str, enum.Enum):
+    active = "active"
+    inactive = "inactive"
+    deleted = "deleted"
+    suspended = "suspended"
+
+class GovLevel(str, enum.Enum):
+    county = "county"
+    national = "national"
+
+class EntityType(str, enum.Enum):
+    ministry = "ministry"
+    department = "department"
+    agency = "agency"
+    county_assembly = "county_assembly"
+    commission = "commission"
+    SAGA = "SAGA"
+    state_corporation = "state_corporation"
+
+class AuthMethod(str, enum.Enum):
+    password = "password"
+    oauth = "oauth"
+    sso = "sso"
+
+class AssetCategory(str, enum.Enum):
+    LAND = "Land"
+    BUILDINGS = "Buildings and building improvements"
+    ROAD_INFRASTRUCTURE = "Road infrastructure"
+    RAILWAY_INFRASTRUCTURE = "Railway infrastructure"
+    OTHER_INFRASTRUCTURE = "Other Infrastructure"
+    MOTOR_VEHICLES = "Motor vehicles, other transport Equipment"
+    ICT_EQUIPMENT = "Computers and other ICT equipment"
+    FURNITURE_FITTINGS = "Furniture, fittings & equipment"
+    INVESTMENT_PROPERTY = "Investment property"
+    LEASED_ASSETS = "Leased Assets"
+    HERITAGE_ASSETS = "Heritage assets"
+    WORK_IN_PROGRESS = "Work in Progress"
+    INTANGIBLE_ASSETS = "Intangible assets"
+    BIOLOGICAL_ASSETS = "Biological assets"
+    SUBSOIL_ASSETS = "Subsoil assets"
+    PLANT_MACHINERY = "Plant and Machinery"
+    PORTABLE_ATTRACTIVE = "Portable and attractive items"
+
+
+class AssetStatus(str, enum.Enum):
+    OPERATIONAL = "Operational"
+    UNDER_MAINTENANCE = "Under Maintenance"
+    IMPAIRED = "Impaired"
+    DISPOSED = "Disposed"
+    HELD_FOR_SALE = "Held for Sale"
+    RETIRED = "Retired"
+    LOST_STOLEN = "Lost/Stolen"
+    WORK_IN_PROGRESS = "Work in Progress"
+
+
+class PolicyEffect(str, enum.Enum):
+    ALLOW = "allow"
+    DENY = "deny"
+
+
+class Departments(Base):
+    __tablename__ = "departments"
+
+    dept_id = Column(String(60), primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    parent_dept_id = Column(String(60), ForeignKey('departments.dept_id'), nullable=True)
+    entity_type = Column(Enum(EntityType), nullable=False)
+    description = Column(Text)
+
+    parent = relationship("Departments", remote_side=[dept_id], backref="sub_departments")
+    users = relationship("Users", back_populates="department")
+    assets = relationship("Assets", back_populates="department")
+    
+
+
+
+
+
+
+
+
+class Users(Base):
+    __tablename__ = "users"
+
+
+    id = Column(String(60), primary_key=True, index=True)
+    full_name = Column(String(50), nullable=False)
+    email = Column(String, unique=True, nullable=False, index=True)
+    phone_number = Column(String(15))
+
+    department_id  = Column(String(60), ForeignKey('departments.dept_id'), nullable=False)
+    position_title = Column(String(255), default = 'member', nullable=False)
+
+    is_accounting_officer = Column(BOOLEAN, default=False, nullable=False)
+
+    password_hash = Column(String, nullable=False)
+
+    roles = Column(JSON)                                  ###
+
+    status = Column(Enum(UserStatus), default=UserStatus.inactive)
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+    last_login = Column(TIMESTAMP)
+    gov_level = Column(Enum(GovLevel), default=GovLevel.county)
+    entity_type = Column(Enum(EntityType), default=EntityType.department)
+    entity_name = Column(String(80),nullable = False)
+
+    location_code = Column(String(30))
+    access_scope = Column(JSON)
+
+    is_two_factor_enabled = Column(BOOLEAN, default=False)
+    last_password_change = Column(TIMESTAMP)
+    login_attempts = Column(Integer,default=0,nullable=False)
+
+    last_activity_at = Column(TIMESTAMP)
+    notes = Column(String)
+    auth_method = Column(Enum(AuthMethod), default=AuthMethod.password)
+
+    
+    tokens = relationship("TokenBase", back_populates="user")
+    department = relationship("Departments", back_populates="users")
+    assets_responsible_for = relationship("Assets", back_populates="responsible_officer")
+
+class AssetCondition(str, enum.Enum):
+    new = "new"
+    excellent = "excellent"
+    good = "good"
+    fair = "fair"
+    poor = "poor"
+
+class Assets(Base):
+    __tablename__ = "assets"
+
+    id = Column(String(60), primary_key=True, index=True)
+    description = Column(Text, nullable=False)
+    category = Column(Enum(AssetCategory), nullable=False, index=True)
+    tag_number = Column(String(100), unique=True, index=True)
+    serial_number = Column(String(100), index=True)
+
+    department_id = Column(String(60), ForeignKey('departments.dept_id'), nullable=False)
+    responsible_officer_id = Column(String(60), ForeignKey('users.id'), nullable=True)
+    location = Column(String(255))
+    
+    status = Column(Enum(AssetStatus), default=AssetStatus.OPERATIONAL, nullable=False, index=True)
+    condition = Column(String(255))
+
+    # Finances
+    acquisition_date = Column(Date)
+    acquisition_cost = Column(Numeric(18, 2), nullable=False)
+    source_of_funds = Column(String(100))
+    current_value = Column(Numeric(18, 2)) # Net Book Value, computed
+    depreciation_rate = Column(Numeric(5, 2))
+    useful_life_years = Column(Integer)
+    
+    # Disposal
+    disposal_date = Column(Date)
+    disposal_value = Column(Numeric(18, 2))
+    disposal_method = Column(String(100))
+
+    # others, json
+    is_portable_attractive = Column(BOOLEAN, default=False)
+    insurance_details = Column(JSON) # smth like  {"provider": "X", "policy_no": "Y", "expiry": "date"}
+    maintenance_schedule = Column(JSON)
+    revaluation_history = Column(JSON)
+    specific_attributes = Column(JSON) # For category-specific fields like L.R. No, GPS, etc.
+    
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
+    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    department = relationship("Departments", back_populates="assets")
+    responsible_officer = relationship("Users", back_populates="assets_responsible_for")
+
+class Actions(Base):
+    __tablename__ = "abac_actions"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), unique=True, nullable=False) # e.g., 'asset.create', 'asset.approve_disposal'
+    description = Column(Text)
+
+
+3. Asset Lifecycle & Events
+Table: asset_ownership_history
+  PK: history_id
+  asset_id → assets
+  from_user_id, to_user_id → users
+  from_dept_id, to_dept_id → departments
+  transfer_date
+  approved_by → users
+  approval_date, remarks
+  
+
+
+Table: maintenance_requests
+  PK: request_id
+  asset_id → assets
+  requested_by → users
+  request_date
+  issue_type (e.g. broken, stolen)
+  description, status
+  assigned_to → users
+  resolved_date, notes
+
+Table: asset_disposals
+  PK: disposal_id 
+  asset_id → assets
+  disposal_method (auction, sale…)
+  disposal_date
+  approved_by → users
+  proceeds_amount, disposal_cost
+  remarks
+
+
+
+4. Requests & Approvals
+Table: general_requests
+  PK: req_id
+  user_id → users
+  req_type (e.g. asset_request, transfer_request)
+  target_asset_id → assets (nullable)
+  department_id → departments
+  request_date, status
+  approved_by → users
+  approval_date, remarks
+
+5. Audit & Compliance Logging
+Table: event_logs
+  PK: log_id
+  user_id → users
+  asset_id → assets (nullable)
+  action_type (CREATE, UPDATE, APPROVE…)
+  action_details (JSON payload)
+  timestamp
+  ip_address
+  
+
+class Policies(Base):
+    __tablename__ = "abac_policies"
+    
+    id = Column(Integer, primary_key=True)
+    description = Column(Text, nullable=False)
+    effect = Column(Enum(PolicyEffect), nullable=False, default=PolicyEffect.ALLOW)
+    
+    # JSON fields provide flexibility to define rules based on attributes
+    user_attributes = Column(JSON, nullable=False) # e.g., {"position_title": "Accounting Officer"}
+    action_names = Column(JSON, nullable=False) # e.g., ["asset.approve_disposal", "asset.write_off"]
+    resource_attributes = Column(JSON, nullable=False) # e.g., {"category": "ICT_EQUIPMENT", "status": "Operational"}
+    
+    priority = Column(Integer, default=0, nullable=False) # not sure if needed
+    is_active = Column(BOOLEAN, default=True, nullable=False)
+
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+    
+    token = Column(String(150), primary_key=True, index=True)
+    user_email = Column(String(50), nullable=False)
+    expires_at = Column(TIMESTAMP, nullable=False)
+    is_used = Column(BOOLEAN, default=False)
+    created_at = Column(TIMESTAMP, default=datetime.utcnow)
